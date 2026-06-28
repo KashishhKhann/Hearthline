@@ -7,10 +7,14 @@ import pandas as pd
 from llm import summarize_theme
 
 
+# Explicit severity rank so sorting is semantic, not alphabetical.
+_SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
 def _risk_signature(risk_flags: list[str] | None) -> str:
     if not risk_flags:
         return "none"
-    return "|".join(sorted(set([str(flag) for flag in risk_flags if str(flag).strip()])))
+    return "|".join(sorted({str(flag) for flag in risk_flags if str(flag).strip()}))
 
 
 def _theme_label(issue_type: str, risk_signature: str) -> str:
@@ -31,12 +35,9 @@ def _theme_label(issue_type: str, risk_signature: str) -> str:
 
 
 def _severity_from_urgency(urgency_labels: list[str]) -> str:
-    if "critical" in urgency_labels:
-        return "critical"
-    if "high" in urgency_labels:
-        return "high"
-    if "medium" in urgency_labels:
-        return "medium"
+    for level in ("critical", "high", "medium", "low"):
+        if level in urgency_labels:
+            return level
     return "low"
 
 
@@ -49,40 +50,34 @@ def _fallback_theme_text(theme_label: str, thread_count: int, properties: list[s
     return insight, action
 
 
+_THEME_COLUMNS = [
+    "theme_label",
+    "severity",
+    "affected_properties",
+    "thread_count",
+    "insight",
+    "portfolio_action",
+    "thread_ids",
+]
+
+
 def build_themes(
     threads_df: pd.DataFrame,
     llm_enabled: bool = True,
     min_cluster_size: int = 2,
 ) -> pd.DataFrame:
     if threads_df.empty:
-        return pd.DataFrame(
-            columns=[
-                "theme_label",
-                "severity",
-                "affected_properties",
-                "thread_count",
-                "insight",
-                "portfolio_action",
-                "thread_ids",
-            ]
-        )
+        return pd.DataFrame(columns=_THEME_COLUMNS)
 
+    # Cluster by issue_type + risk_signature only — no property or day bucket so
+    # cross-property portfolio patterns can emerge.
     clusters: dict[tuple, list[dict]] = defaultdict(list)
 
     for row in threads_df.to_dict(orient="records"):
-        ts = row.get("latest_timestamp")
-        if pd.isna(ts):
-            day_bucket = "unknown_day"
-        else:
-            day_bucket = pd.Timestamp(ts).floor("D").isoformat()
-
         risk_signature = _risk_signature(row.get("risk_flags", []))
         key = (
             row.get("issue_type", "operational_internal"),
-            row.get("urgency_label", "low"),
-            row.get("property_name", "Unknown Property"),
             risk_signature,
-            day_bucket,
         )
         clusters[key].append(row)
 
@@ -92,11 +87,11 @@ def build_themes(
         if len(rows) < min_cluster_size:
             continue
 
-        issue_type, _urgency, _property_name, risk_signature, _day_bucket = key
+        issue_type, risk_signature = key
 
         thread_ids = [str(row.get("thread_id", "")) for row in rows]
         affected_properties = sorted(
-            set([str(row.get("property_name", "Unknown Property")) for row in rows])
+            {str(row.get("property_name", "Unknown Property")) for row in rows}
         )
         urgency_labels = [str(row.get("urgency_label", "low")) for row in rows]
 
@@ -129,20 +124,15 @@ def build_themes(
         theme_rows.append(theme_obj)
 
     if not theme_rows:
-        return pd.DataFrame(
-            columns=[
-                "theme_label",
-                "severity",
-                "affected_properties",
-                "thread_count",
-                "insight",
-                "portfolio_action",
-                "thread_ids",
-            ]
-        )
+        return pd.DataFrame(columns=_THEME_COLUMNS)
 
     out_df = pd.DataFrame(theme_rows)
-    out_df = out_df.sort_values(by=["thread_count", "severity"], ascending=[False, True]).reset_index(
-        drop=True
-    )
+
+    # Sort by thread_count descending, then severity (critical first) using rank map.
+    out_df["_severity_rank"] = out_df["severity"].map(_SEVERITY_RANK).fillna(9)
+    out_df = out_df.sort_values(
+        by=["thread_count", "_severity_rank"],
+        ascending=[False, True],
+    ).drop(columns=["_severity_rank"]).reset_index(drop=True)
+
     return out_df

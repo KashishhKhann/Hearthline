@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from constants import contains_any, contains_word, is_welfare_signal
+
 
 ISSUE_TYPES = {
     "emergency_maintenance",
@@ -11,14 +13,12 @@ ISSUE_TYPES = {
     "legal",
     "operational_internal",
     "vendor_management",
+    "prospect",
 }
 
-
-EMERGENCY_SIGNALS = {
+EMERGENCY_TERMS = {
     "leak",
-    "water leak",
     "electrical hazard",
-    "electrical issue",
     "no heating",
     "no heat",
     "no hot water",
@@ -29,126 +29,156 @@ EMERGENCY_SIGNALS = {
     "health and safety",
     "baby",
     "elderly",
-    "urgent",
-    "emergency",
+    "welfare check",
 }
 
-LEGAL_SIGNALS = {
+# Word-boundary sensitive: "legal" must not match "paralegal", "rent" not "parent", etc.
+LEGAL_TERMS_WB = {
     "rtb",
     "legal",
     "dispute",
-    "tribunal",
     "solicitor",
-    "court",
-    "eviction",
-    "evict",
+    "legal action",
+    "tribunal",
+    "compensation",
+    "environmental health",
 }
 
-FINANCIAL_SIGNALS = {
+REPEATED_UNRESOLVED_TERMS = {
+    "still not fixed",
+    "third time",
+    "following up",
+    "still waiting",
+    "as mentioned",
+}
+
+# "again" alone is too common — keep it in a word-boundary set
+REPEATED_UNRESOLVED_TERMS_WB = {
+    "again",
+}
+
+CONTRACTOR_THREAT_TERMS = {
+    "stop work",
+    "withhold service",
+    "legal notice",
+    "threatened action",
+}
+
+LANDLORD_DEADLINE_TERMS = {
+    "deadline",
+    "board meeting",
+    "hard deadline",
+    "report due",
+    "close of business",
+}
+
+COMMERCIAL_TERMS = {
+    "viewing request",
+    "corporate let inquiry",
+    "corporate let",
+    "prospect",
+    "viewing",
+}
+
+FINANCIAL_TERMS_WB = {
     "rent",
     "arrears",
     "invoice",
-    "overdue invoice",
-    "payment hold",
     "deposit",
     "refund",
-    "payment",
 }
 
-LEASING_SIGNALS = {
-    "viewing request",
-    "viewing",
-    "corporate let",
-    "corporate let inquiry",
-    "lease",
-    "application",
-    "prospect",
+FINANCIAL_TERMS = {
+    "overdue invoice",
+    "payment hold",
+    "standing order",
+    "direct debit",
 }
 
-MOVE_OUT_SIGNALS = {
+VENDOR_TERMS_WB = {
+    "contractor",
+    "vendor",
+    "quote",
+    "sla",
+}
+
+VENDOR_TERMS = {
+    "work order",
+}
+
+MOVE_OUT_TERMS = {
     "move out",
     "move-out",
     "vacate",
-    "checkout",
     "check-out",
     "handover",
 }
 
-VENDOR_SIGNALS = {
-    "contractor",
-    "vendor",
-    "quote",
-    "work order",
-    "dispatch",
-    "sla",
-}
-
-COMPLAINT_SIGNALS = {
-    "complaint",
+COMPLAINT_TERMS_WB = {
     "noise",
     "harassment",
+}
+
+COMPLAINT_TERMS = {
+    "complaint",
     "unhappy",
     "frustrated",
 }
 
-MAINTENANCE_SIGNALS = {
-    "repair",
+MAINTENANCE_TERMS_WB = {
     "maintenance",
+    "repair",
     "broken",
-    "heating",
     "plumbing",
+    "heating",
     "electrical",
-    "appliance",
-    "inspection",
 }
 
-REPEATED_FOLLOW_UP_SIGNALS = {
-    "following up",
-    "follow up again",
-    "as mentioned",
-    "still waiting",
-    "still unresolved",
-    "third email",
-    "second reminder",
+LEASING_TERMS_WB = {
+    "lease",
+    "renewal",
+    "application",
+    "availability",
 }
 
-ISSUE_BASE_SCORE = {
-    "emergency_maintenance": 65,
-    "legal": 55,
-    "financial": 45,
+
+ISSUE_BASE = {
+    "emergency_maintenance": 62,
+    "legal": 56,
+    "financial": 44,
+    "vendor_management": 38,
     "complaint": 40,
-    "maintenance": 38,
-    "move_out": 32,
-    "vendor_management": 30,
-    "leasing": 22,
+    "maintenance": 36,
+    "move_out": 30,
+    "leasing": 24,
+    "prospect": 22,
     "operational_internal": 18,
 }
 
 
-def _contains_any(text: str, terms: set[str]) -> bool:
-    return any(term in text for term in terms)
-
-
 def classify_issue(text: str) -> str:
-    """Classify issue type using transparent keyword rules."""
     content = (text or "").lower()
 
-    if _contains_any(content, EMERGENCY_SIGNALS):
+    if is_welfare_signal(content):
         return "emergency_maintenance"
-    if _contains_any(content, LEGAL_SIGNALS):
+    if contains_word(content, LEGAL_TERMS_WB):
         return "legal"
-    if _contains_any(content, FINANCIAL_SIGNALS):
+    if contains_any(content, EMERGENCY_TERMS):
+        return "emergency_maintenance"
+    if contains_word(content, FINANCIAL_TERMS_WB) or contains_any(content, FINANCIAL_TERMS):
         return "financial"
-    if _contains_any(content, LEASING_SIGNALS):
-        return "leasing"
-    if _contains_any(content, MOVE_OUT_SIGNALS):
-        return "move_out"
-    if _contains_any(content, VENDOR_SIGNALS):
+    if contains_any(content, COMMERCIAL_TERMS):
+        return "prospect"
+    if contains_word(content, VENDOR_TERMS_WB) or contains_any(content, VENDOR_TERMS):
         return "vendor_management"
-    if _contains_any(content, COMPLAINT_SIGNALS):
+    if contains_any(content, MOVE_OUT_TERMS):
+        return "move_out"
+    if contains_any(content, COMPLAINT_TERMS) or contains_word(content, COMPLAINT_TERMS_WB):
         return "complaint"
-    if _contains_any(content, MAINTENANCE_SIGNALS):
+    if contains_word(content, MAINTENANCE_TERMS_WB):
         return "maintenance"
+    if contains_word(content, LEASING_TERMS_WB):
+        return "leasing"
 
     return "operational_internal"
 
@@ -159,53 +189,70 @@ def score_urgency(
     sender_type: str,
     unread: int,
     attachment_count: int,
+    issue_type: str | None = None,
 ) -> tuple[int, list[str]]:
-    """Return deterministic urgency score and fired rule reasons."""
-    subject_text = (subject or "").lower()
-    body_text = (body or "").lower()
-    text = f"{subject_text}\n{body_text}"
+    """Score urgency for a thread.
 
-    issue_type = classify_issue(text)
-    score = ISSUE_BASE_SCORE[issue_type]
-    reasons: list[str] = [f"issue_type={issue_type} base={score}"]
+    Args:
+        issue_type: Pre-computed issue type. If None, it is derived from text
+                    (avoids double-calling classify_issue when the caller already has it).
+    """
+    text = f"{subject or ''}\n{body or ''}".lower()
 
-    if _contains_any(text, EMERGENCY_SIGNALS):
-        score += 20
-        reasons.append("emergency signal detected (+20)")
+    if issue_type is None:
+        issue_type = classify_issue(text)
 
-    if _contains_any(text, {"baby", "elderly", "health and safety"}):
-        score += 10
-        reasons.append("vulnerable resident / safety context (+10)")
+    score = ISSUE_BASE[issue_type]
+    reasons = [f"base score for {issue_type} = {score}"]
 
-    if _contains_any(text, LEGAL_SIGNALS):
-        score += 14
-        reasons.append("legal/RTB/dispute signal (+14)")
+    if is_welfare_signal(text):
+        score = max(score, 90)
+        reasons.append("potential welfare-check concern detected (forced critical floor)")
 
-    if _contains_any(text, {"overdue invoice", "payment hold"}):
+    if contains_any(text, EMERGENCY_TERMS):
+        score += 24
+        reasons.append("strong maintenance safety signal (+24)")
+
+    if contains_word(text, LEGAL_TERMS_WB):
+        score += 18
+        reasons.append("legal/compliance risk signal (+18)")
+
+    if contains_any(text, REPEATED_UNRESOLVED_TERMS) or contains_word(text, REPEATED_UNRESOLVED_TERMS_WB):
         score += 12
-        reasons.append("contractor payment hold / overdue invoice (+12)")
+        reasons.append("repeated unresolved follow-up (+12)")
 
-    if _contains_any(text, REPEATED_FOLLOW_UP_SIGNALS):
+    if contains_any(text, CONTRACTOR_THREAT_TERMS):
+        score += 14
+        reasons.append("contractor threatened action (+14)")
+
+    if contains_any(text, LANDLORD_DEADLINE_TERMS):
         score += 10
-        reasons.append("repeated unresolved follow-up signal (+10)")
+        reasons.append("hard reporting deadline (+10)")
 
-    if _contains_any(text, {"viewing request", "corporate let inquiry"}):
+    if contains_word(text, {"baby", "elderly"}) or "health and safety" in text:
+        score += 10
+        reasons.append("vulnerable resident / health risk (+10)")
+
+    if issue_type == "prospect":
         score -= 8
-        reasons.append("commercial inquiry (non-emergency) (-8)")
+        reasons.append("commercial opportunity, non-emergency baseline adjustment (-8)")
 
     sender = (sender_type or "unknown").strip().lower()
-    if sender == "legal":
-        score += 10
-        reasons.append("latest sender type legal (+10)")
-    elif sender == "tenant":
+    if sender == "tenant":
         score += 6
-        reasons.append("latest sender type tenant (+6)")
+        reasons.append("latest sender is tenant (+6)")
+    elif sender == "legal":
+        score += 10
+        reasons.append("latest sender is legal (+10)")
+    elif sender == "landlord":
+        score += 6
+        reasons.append("latest sender is landlord (+6)")
     elif sender == "prospect":
-        score += 4
-        reasons.append("latest sender type prospect (+4)")
+        score += 3
+        reasons.append("latest sender is prospect (+3)")
     elif sender == "system":
         score -= 5
-        reasons.append("latest sender type system (-5)")
+        reasons.append("latest sender is system (-5)")
 
     unread_points = min(max(int(unread), 0) * 5, 20)
     if unread_points:
@@ -229,3 +276,44 @@ def label_urgency(score: int) -> str:
     if score >= 35:
         return "medium"
     return "low"
+
+
+# ── Sentiment scoring ─────────────────────────────────────────────────────────
+
+_SENTIMENT_URGENT = {
+    "emergency", "flooding", "flood", "no heat", "no heating", "no hot water",
+    "help", "asap", "immediately", "right now", "urgent", "fire alarm",
+    "gas leak", "gas smell",
+}
+_SENTIMENT_ANGRY = {
+    "unacceptable", "ridiculous", "disgusting", "outrageous", "furious",
+    "legal action", "solicitor", "complaint", "threatening", "demand",
+    "absolutely appalling", "sick of this", "fed up",
+}
+_SENTIMENT_FRUSTRATED = {
+    "still not fixed", "third time", "following up", "still waiting",
+    "nothing has been done", "no response", "ignored", "as mentioned",
+    "again and again", "keep asking", "weeks now", "months now",
+}
+_SENTIMENT_CONCERNED = {
+    "worried", "concerned", "wondering", "just checking", "wanted to let you know",
+    "please advise", "could you let me know", "any update",
+}
+
+
+def score_sentiment(text: str) -> str:
+    """Derive tenant tone from thread text.
+
+    Returns one of: urgent | angry | frustrated | concerned | neutral.
+    Evaluated in priority order (urgent > angry > frustrated > concerned).
+    """
+    t = (text or "").lower()
+    if contains_any(t, _SENTIMENT_URGENT):
+        return "urgent"
+    if contains_any(t, _SENTIMENT_ANGRY):
+        return "angry"
+    if contains_any(t, _SENTIMENT_FRUSTRATED):
+        return "frustrated"
+    if contains_any(t, _SENTIMENT_CONCERNED):
+        return "concerned"
+    return "neutral"

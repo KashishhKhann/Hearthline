@@ -1,251 +1,345 @@
 from __future__ import annotations
 
+import os
 from collections import Counter
 from typing import Any
 
 import pandas as pd
 
-from llm import generate_thread_llm_fields
-from parsing import load_and_prepare_data
-from scoring import classify_issue, label_urgency, score_urgency
+from autoresolve import evaluate_auto_resolve, load_templates
+from constants import thread_text as _thread_text_from_df
+from escalation import detect_human_required
+from ingest import group_emails_by_thread, load_and_prepare
+from llm import (
+    draft_reply,
+    fallback_action,
+    fallback_action_owner,
+    fallback_human_context,
+    fallback_summary,
+    llm_is_available,
+    recommend_action,
+    summarize_human_context,
+    summarize_thread,
+)
+from scoring import classify_issue, label_urgency, score_urgency, score_sentiment
+from themes import build_themes
 
 
-THREAD_COLUMNS = [
+THREAD_OUTPUT_COLUMNS = [
     "thread_id",
     "property_id",
     "property_name",
+    "subject",
     "primary_sender_type",
     "latest_sender_type",
     "participants",
-    "participant_types",
     "issue_type",
-    "summary",
     "urgency_score",
     "urgency_label",
+    "tier",
+    "handling_reason",
+    "summary",
     "recommended_action",
+    "draft_reply",
     "reasoning",
     "unread_count",
     "attachment_count",
-    "last_timestamp",
+    "email_count",
+    "latest_timestamp",
+    "participant_types",
+    "risk_flags",
+    "template_id",
+    "sentiment",
+    "action_owner",
 ]
 
+TIER_PRIORITY = {"human": 0, "ai": 1, "auto": 2}
 
-def _choose_thread_property(group: pd.DataFrame) -> tuple[str | None, str]:
+
+def _choose_property(group: pd.DataFrame) -> tuple[str | None, str, str]:
     property_ids = [
         str(value)
-        for value in group["from_property_id"].tolist()
+        for value in group["resolved_property_id"].tolist()
         if value is not None and str(value).strip()
     ]
+    chosen = Counter(property_ids).most_common(1)[0][0] if property_ids else None
 
-    if not property_ids:
-        return None, "Unknown Property"
+    matching = group[group["resolved_property_id"] == chosen] if chosen is not None else pd.DataFrame()
 
-    chosen_property_id = Counter(property_ids).most_common(1)[0][0]
-    matching = group[group["from_property_id"] == chosen_property_id]
+    property_name = "Unknown Property"
+    property_manager = "Property Manager"
 
     if not matching.empty:
         property_name = str(matching.iloc[0].get("property_name", "Unknown Property") or "Unknown Property")
-    else:
-        property_name = "Unknown Property"
+        manager = str(matching.iloc[0].get("property_manager", "") or "").strip()
+        if manager:
+            property_manager = manager
 
-    if property_name == "Unknown Property" and chosen_property_id:
-        property_name = f"Unknown Property ({chosen_property_id})"
-
-    return chosen_property_id, property_name
+    return chosen, property_name, property_manager
 
 
-def _collect_participants(group: pd.DataFrame) -> list[str]:
-    participants: set[str] = set()
+def _participants(group: pd.DataFrame) -> list[str]:
+    values: set[str] = set()
 
-    for _, row in group.iterrows():
-        sender_email = str(row.get("from_email", "") or "").strip()
-        if sender_email:
-            participants.add(sender_email)
+    for row in group.itertuples():
+        sender = str(getattr(row, "from_email", "") or "").strip()
+        if sender:
+            values.add(sender)
 
-        for recipient in row.get("to", []):
-            target = str(recipient).strip()
-            if target:
-                participants.add(target)
+        for target in getattr(row, "to", []):
+            item = str(target).strip()
+            if item:
+                values.add(item)
 
-        for recipient in row.get("cc", []):
-            target = str(recipient).strip()
-            if target:
-                participants.add(target)
+        for target in getattr(row, "cc", []):
+            item = str(target).strip()
+            if item:
+                values.add(item)
 
-    return sorted(participants)
+    return sorted(values)
 
 
-def _collect_participant_types(group: pd.DataFrame) -> list[str]:
-    types = sorted(
+def _participant_types(group: pd.DataFrame) -> list[str]:
+    values = sorted(
         {
-            str(value).strip().lower()
-            for value in group["from_type"].tolist()
-            if str(value).strip()
+            str(v).strip().lower()
+            for v in group["from_type"].tolist()
+            if str(v).strip()
         }
     )
-    return types or ["unknown"]
+    return values or ["unknown"]
 
 
-def _build_message_dicts(group: pd.DataFrame) -> list[dict[str, Any]]:
-    ordered = group.sort_values(
-        by=["thread_position", "timestamp"],
-        ascending=[True, True],
-        kind="mergesort",
-    )
+def _latest_sender_first_name(group: pd.DataFrame) -> str:
+    latest_name = str(group.iloc[-1].get("from_name", "") or "").strip()
+    if not latest_name:
+        return "there"
+    return latest_name.split(" ")[0]
 
+
+def _thread_subject(group: pd.DataFrame) -> str:
+    subjects = [str(s).strip() for s in group["subject"].tolist() if str(s).strip()]
+    if not subjects:
+        return "(no subject)"
+    return subjects[0]
+
+
+def _thread_text(group: pd.DataFrame) -> str:
+    """Build a plain text blob from all emails in the group."""
+    return _thread_text_from_df(group)
+
+
+def _thread_messages(group: pd.DataFrame) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
-    for _, row in ordered.iterrows():
-        timestamp = row.get("timestamp")
-        ts_text = timestamp.isoformat() if pd.notna(timestamp) else ""
+    for row in group.itertuples():
+        ts = getattr(row, "timestamp")
         messages.append(
             {
-                "id": row.get("id", ""),
-                "thread_position": int(row.get("thread_position", 10**9) or 10**9),
-                "timestamp": ts_text,
-                "from_type": row.get("from_type", "unknown"),
-                "from_email": row.get("from_email", ""),
-                "subject": row.get("subject", ""),
-                "body": row.get("body", ""),
-                "read": bool(row.get("read", False)),
-                "attachments": row.get("attachments", []),
+                "id": getattr(row, "id", ""),
+                "thread_position": int(getattr(row, "thread_position", 10**9) or 10**9),
+                "timestamp": ts.isoformat() if pd.notna(ts) else "",
+                "from_type": getattr(row, "from_type", "unknown"),
+                "from_email": getattr(row, "from_email", ""),
+                "subject": getattr(row, "subject", ""),
+                "body": getattr(row, "body", ""),
+                "read": bool(getattr(row, "read", False)),
+                "attachments": getattr(row, "attachments", []),
             }
         )
-
     return messages
 
 
-def build_thread_dataframe(emails_df: pd.DataFrame, llm_enabled: bool = True) -> tuple[pd.DataFrame, list[str]]:
-    if emails_df.empty:
-        return pd.DataFrame(columns=THREAD_COLUMNS), ["No emails available to aggregate."]
-
+def analyze_threads(
+    emails_df: pd.DataFrame,
+    templates: dict,
+    llm_enabled: bool = True,
+) -> tuple[pd.DataFrame, list[str]]:
     warnings: list[str] = []
     records: list[dict[str, Any]] = []
 
-    grouped = emails_df.groupby("thread_id", dropna=False)
+    grouped = group_emails_by_thread(emails_df)
 
-    for thread_id, group in grouped:
-        ordered = group.sort_values(
-            by=["thread_position", "timestamp"],
-            ascending=[True, True],
-            kind="mergesort",
-        )
+    llm_base_url = os.getenv("LLM_BASE_URL", "").strip()
+    llm_enabled_effective = llm_enabled
+    if llm_enabled_effective and not llm_base_url:
+        warnings.append("LLM_BASE_URL missing; deterministic fallback content is being used.")
+        llm_enabled_effective = False
+    elif llm_enabled_effective and not llm_is_available():
+        warnings.append("Local LLM endpoint unavailable; deterministic fallback content is being used.")
+        llm_enabled_effective = False
 
-        first_row = ordered.iloc[0]
-        last_row = ordered.iloc[-1]
+    for thread_id, group in grouped.items():
+        # group_emails_by_thread already sorts; reset index for clean iloc access
+        ordered = group.reset_index(drop=True)
 
-        property_id, property_name = _choose_thread_property(ordered)
-        participants = _collect_participants(ordered)
-        participant_types = _collect_participant_types(ordered)
+        property_id, property_name, property_manager = _choose_property(ordered)
 
-        subject_concat = " | ".join(
-            [str(value).strip() for value in ordered["subject"].tolist() if str(value).strip()]
-        )
-        body_concat = "\n\n".join(
-            [str(value).strip() for value in ordered["body"].tolist() if str(value).strip()]
-        )
-        full_text = f"{subject_concat}\n{body_concat}".strip()
+        subject = _thread_subject(ordered)
+        thread_text = _thread_text(ordered)
 
-        issue_type = classify_issue(full_text)
+        # classify_issue once; pass result into score_urgency to avoid double-calling
+        issue_type = classify_issue(f"{subject}\n{thread_text}")
+
+        primary_sender_type = str(ordered.iloc[0].get("from_type", "unknown") or "unknown").lower()
+        latest_sender_type = str(ordered.iloc[-1].get("from_type", "unknown") or "unknown").lower()
 
         unread_count = int((~ordered["read"]).sum())
         attachment_count = int(ordered["attachments"].apply(len).sum())
+        email_count = int(len(ordered))
+        latest_timestamp = ordered["timestamp"].max()
 
         score, reasons = score_urgency(
-            subject=subject_concat,
-            body=body_concat,
-            sender_type=str(last_row.get("from_type", "unknown") or "unknown"),
+            subject=subject,
+            body=thread_text,
+            sender_type=latest_sender_type,
             unread=unread_count,
             attachment_count=attachment_count,
+            issue_type=issue_type,
         )
         urgency_label = label_urgency(score)
+        sentiment = score_sentiment(f"{subject}\n{thread_text}")
 
-        message_dicts = _build_message_dicts(ordered)
-        thread_bundle = {
-            "thread_id": str(thread_id),
+        base_bundle = {
+            "thread_id": thread_id,
             "property_id": property_id,
             "property_name": property_name,
-            "primary_sender_type": str(first_row.get("from_type", "unknown") or "unknown"),
-            "latest_sender_type": str(last_row.get("from_type", "unknown") or "unknown"),
-            "participants": participants,
-            "participant_types": participant_types,
+            "property_manager": property_manager,
+            "subject": subject,
+            "thread_text": thread_text,
+            "messages": _thread_messages(ordered),
+            "primary_sender_type": primary_sender_type,
+            "latest_sender_type": latest_sender_type,
+            "latest_sender_name": str(ordered.iloc[-1].get("from_name", "") or ""),
+            "latest_sender_first_name": _latest_sender_first_name(ordered),
+            "participants": _participants(ordered),
+            "participant_types": _participant_types(ordered),
             "issue_type": issue_type,
             "urgency_score": score,
             "urgency_label": urgency_label,
             "unread_count": unread_count,
             "attachment_count": attachment_count,
-            "messages": message_dicts,
+            "email_count": email_count,
         }
 
-        if llm_enabled:
-            llm_fields = generate_thread_llm_fields(thread_bundle)
-            if llm_fields.get("warning"):
-                warnings.append(llm_fields["warning"])
-            summary = llm_fields.get("summary", "")
-            recommended_action = llm_fields.get("recommended_action", "")
-        else:
-            summary = (
-                f"{property_name}: {issue_type.replace('_', ' ')} thread with "
-                f"{unread_count} unread message(s)."
-            )
-            recommended_action = "Review latest message and assign next owner action."
+        escalation = detect_human_required(ordered)
 
-        records.append(
-            {
-                "thread_id": str(thread_id),
-                "property_id": property_id,
-                "property_name": property_name,
-                "primary_sender_type": str(first_row.get("from_type", "unknown") or "unknown"),
-                "latest_sender_type": str(last_row.get("from_type", "unknown") or "unknown"),
-                "participants": participants,
-                "participant_types": participant_types,
-                "issue_type": issue_type,
-                "summary": summary,
-                "urgency_score": score,
-                "urgency_label": urgency_label,
-                "recommended_action": recommended_action,
-                "reasoning": "; ".join(reasons),
-                "unread_count": unread_count,
-                "attachment_count": attachment_count,
-                "last_timestamp": ordered["timestamp"].max(),
-            }
-        )
+        tier = "ai"
+        handling_reason = ""
+        template_id = None
+        risk_flags = escalation.get("risk_flags", [])
+        summary = ""
+        action = ""
+        draft = ""
+
+        if escalation.get("is_human"):
+            tier = "human"
+            handling_reason = escalation.get("handling_reason", "Escalation risk detected.")
+            bundle = {**base_bundle, "tier": tier, "handling_reason": handling_reason}
+            summary = (
+                summarize_human_context(bundle)
+                if llm_enabled_effective
+                else fallback_human_context(bundle)
+            )
+            action = fallback_action(bundle)
+            draft = ""
+        else:
+            auto = evaluate_auto_resolve(base_bundle, templates)
+            if auto.get("is_auto"):
+                tier = "auto"
+                handling_reason = auto.get("handling_reason", "FAQ match")
+                template_id = auto.get("template_id")
+                draft = auto.get("draft_reply", "")
+
+                if not auto.get("strong_signal_present", False):
+                    score = min(score, 25)
+                    urgency_label = "low"
+                    reasons.append("FAQ auto-resolve with no strong signal -> urgency forced low")
+
+                bundle = {
+                    **base_bundle,
+                    "tier": tier,
+                    "handling_reason": handling_reason,
+                    "urgency_score": score,
+                    "urgency_label": urgency_label,
+                }
+                summary = fallback_summary(bundle)
+                action = fallback_action(bundle)
+            else:
+                tier = "ai"
+                handling_reason = "Not escalation and not FAQ; AI draft ready."
+                bundle = {**base_bundle, "tier": tier, "handling_reason": handling_reason}
+
+                if llm_enabled_effective:
+                    summary = summarize_thread(bundle)
+                    action = recommend_action(bundle)
+                    draft = draft_reply(bundle)
+                else:
+                    summary = fallback_summary(bundle)
+                    action = fallback_action(bundle)
+                    draft = ""
+
+        action_owner = fallback_action_owner({"tier": tier, "issue_type": issue_type})
+
+        record = {
+            "thread_id": thread_id,
+            "property_id": property_id,
+            "property_name": property_name,
+            "subject": subject,
+            "primary_sender_type": primary_sender_type,
+            "latest_sender_type": latest_sender_type,
+            "participants": base_bundle["participants"],
+            "issue_type": issue_type,
+            "urgency_score": int(score),
+            "urgency_label": urgency_label,
+            "tier": tier,
+            "handling_reason": handling_reason,
+            "summary": summary,
+            "recommended_action": action,
+            "draft_reply": draft if tier != "human" else "",
+            "reasoning": "; ".join(reasons),
+            "unread_count": unread_count,
+            "attachment_count": attachment_count,
+            "email_count": email_count,
+            "latest_timestamp": latest_timestamp,
+            "participant_types": base_bundle["participant_types"],
+            "risk_flags": risk_flags,
+            "template_id": template_id,
+            "sentiment": sentiment,
+            "action_owner": action_owner,
+        }
+        records.append(record)
 
     thread_df = pd.DataFrame(records)
+
+    for col in THREAD_OUTPUT_COLUMNS:
+        if col not in thread_df.columns:
+            thread_df[col] = None
+
+    thread_df["tier_priority"] = thread_df["tier"].map(TIER_PRIORITY).fillna(9)
     thread_df = thread_df.sort_values(
-        by=["urgency_score", "last_timestamp"],
-        ascending=[False, False],
+        by=["urgency_score", "tier_priority", "latest_timestamp"],
+        ascending=[False, True, False],
         kind="mergesort",
     ).reset_index(drop=True)
 
-    warnings = sorted(set(warnings))
-
-    for column in THREAD_COLUMNS:
-        if column not in thread_df.columns:
-            thread_df[column] = None
-
-    return thread_df[THREAD_COLUMNS], warnings
+    return thread_df[THREAD_OUTPUT_COLUMNS], sorted(set(warnings))
 
 
-def run_pipeline(dataset_path: str, llm_enabled: bool = True) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    emails_df, _, parse_warnings = load_and_prepare_data(dataset_path)
-    thread_df, thread_warnings = build_thread_dataframe(emails_df, llm_enabled=llm_enabled)
+def run_pipeline(
+    dataset_path: str = "data/proptech-test-data.json",
+    templates_path: str = "templates.json",
+    llm_enabled: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
+    emails_df, _properties_df, ingest_warnings = load_and_prepare(dataset_path)
+    templates = load_templates(templates_path)
 
-    mixed_property_threads = 0
-    if not emails_df.empty:
-        for _, group in emails_df.groupby("thread_id"):
-            ids = {
-                str(value)
-                for value in group["from_property_id"].tolist()
-                if value is not None and str(value).strip()
-            }
-            if len(ids) > 1:
-                mixed_property_threads += 1
+    thread_df, thread_warnings = analyze_threads(
+        emails_df=emails_df,
+        templates=templates,
+        llm_enabled=llm_enabled,
+    )
 
-    extra_warnings: list[str] = []
-    if mixed_property_threads:
-        extra_warnings.append(
-            f"{mixed_property_threads} threads had multiple property_id values; most frequent value was used."
-        )
+    themes_df = build_themes(thread_df, llm_enabled=llm_enabled, min_cluster_size=2)
 
-    warnings = sorted(set(parse_warnings + thread_warnings + extra_warnings))
-    return thread_df, emails_df, warnings
+    warnings = sorted(set(ingest_warnings + thread_warnings))
+    return thread_df, themes_df, emails_df, warnings

@@ -1,68 +1,89 @@
-# Lette Inbox Copilot
+# Lette Inbox Triage (Hackathon MVP)
 
-Local Python + Streamlit MVP for property-management inbox triage.
+Local Python + Streamlit app that triages property-management email threads into 3 handling tiers:
+- `auto` (auto-resolve with templates)
+- `ai` (AI draft ready)
+- `human` (human required, no customer-facing draft)
 
-It reads a JSON email dataset, groups by `thread_id`, classifies issue type, applies deterministic urgency scoring, and ranks threads for action. Optional LLM enrichment uses OpenAI for only:
-- thread summary
-- recommended next action
+The app uses deterministic ingestion/tiering/scoring and optional local LLM enrichments through an OpenAI-compatible chat completions interface.
 
-If OpenAI is not configured or fails, deterministic fallback text is used.
+## Project Structure
+- `app.py`
+- `ingest.py`
+- `escalation.py`
+- `autoresolve.py`
+- `scoring.py`
+- `llm.py`
+- `themes.py`
+- `pipeline.py`
+- `templates.json`
+- `requirements.txt`
+- `README.md`
 
 ## Setup
-1. Create and activate a virtual environment:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-```
-
-2. Install dependencies:
-```bash
 pip install -r requirements.txt
 ```
 
-3. (Optional) Set environment variables for OpenAI:
+## Environment Variables
 ```bash
-export OPENAI_API_KEY=your_api_key_here
-export OPENAI_MODEL=gpt-4o-mini
-export OPENAI_TIMEOUT_S=20
+export LLM_MODEL=mistral-small-3.2-24b-instruct
+export LLM_BASE_URL=http://localhost:1234/v1
+export LLM_API_KEY=local-dev-key
+# optional
+export LLM_TIMEOUT_S=20
 ```
 
-4. (Optional) Override dataset path:
-```bash
-export DATASET_PATH=data/proptech-test-data.json
-```
+Notes:
+- `LLM_MODEL` defaults to `mistral-small-3.2-24b-instruct`.
+- If `LLM_BASE_URL` is missing/unreachable, app falls back to deterministic summary/action/draft/theme text.
 
 ## Run
 ```bash
 streamlit run app.py
 ```
 
-Default dataset path used by the app:
+Default dataset path in app:
 - `data/proptech-test-data.json`
 
-## Project Structure
-- `app.py`: Streamlit UI (metrics, filters, ranked table, thread detail/timeline)
-- `parsing.py`: JSON load, email flattening, properties dataframe, property enrichment
-- `scoring.py`: rule-based issue classification and urgency scoring
-- `llm.py`: OpenAI summary/action + deterministic fallback
-- `pipeline.py`: thread-level aggregation pipeline
-- `requirements.txt`: minimal dependencies
-- `data/proptech-test-data.json`: sample dataset
+## Tier Logic (Order Matters)
+1. Human-required detection (`escalation.py`)
+2. Auto-resolve FAQ matching (`autoresolve.py`)
+3. Remaining threads are AI draft ready (`llm.py`)
 
-## Environment Variables
-- `OPENAI_API_KEY` (optional): enables LLM summary/action
-- `OPENAI_MODEL` (optional, default `gpt-4o-mini`)
-- `OPENAI_TIMEOUT_S` (optional, default `20`)
-- `DATASET_PATH` (optional, default `data/proptech-test-data.json`)
+## Inbox Sorting
+Threads are sorted by:
+1. `urgency_score` descending
+2. tier priority: `human` > `ai` > `auto`
+3. `latest_timestamp` descending
+
+## Demo Scenarios
+1. Critical maintenance
+- Example: leak/no heating/fire alarm with unread follow-ups.
+- Expected: high urgency; often `human` or `ai` depending on escalation rules.
+
+2. Legal/compliance risk
+- Example: RTB/solicitor/legal action/environmental health language in multi-email thread.
+- Expected: `human` tier with `do not auto-respond`; context summary for manager.
+
+3. Commercial opportunity
+- Example: viewing request or corporate let inquiry.
+- Expected: `prospect` issue type, generally lower urgency than emergencies, typically `ai` tier unless FAQ template match.
 
 ## Known Limitations
-- Single-file local runtime; no database/auth/background jobs.
-- Keyword rules are deterministic and intentionally simple for hackathon speed.
-- LLM outputs are best-effort and may vary; fallback remains deterministic.
-- No automated test suite yet (sanity checks done via pipeline run + app run).
+- Rule-based NLP only (keyword matching).
+- No database/auth/background workers.
+- LLM calls are best-effort and depend on local endpoint availability.
+- Single-process Streamlit MVP for demo use.
 
-## Future Improvements
-- Add unit tests for parsing/scoring/pipeline.
-- Add configurable scoring weights and keyword dictionaries.
-- Add richer thread explainability and SLA timers.
-- Add CSV export for ranked queue.
+## Quick Sanity Check
+```bash
+python3 -m py_compile app.py ingest.py escalation.py autoresolve.py scoring.py llm.py themes.py pipeline.py
+python3 - <<'PY'
+from pipeline import run_pipeline
+threads, themes, emails, warnings = run_pipeline('data/proptech-test-data.json', llm_enabled=True)
+print(len(threads), len(themes), len(emails), warnings[:2])
+PY
+```
