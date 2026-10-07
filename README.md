@@ -48,7 +48,9 @@ Rules are deterministic and explainable (every thread shows its scoring reasonin
 | `constants.py` | Shared term sets and word-boundary matching |
 | `ui_compat.py` | Streamlit compatibility shim for embedded HTML |
 | `data/proptech-test-data.json` | Sample dataset (100 emails, 92 threads, 5 properties) |
-| `tests/` | pytest suite (store, API, webhooks with real Twilio signatures, alerts, replies, triage) |
+| `backend/dispatch.py` | Contractor job offers by SMS and YES / NO / DONE replies |
+| `eval/evaluate.py` | Labelling sheet + precision/recall report, optionally against an older commit |
+| `tests/` | pytest suite (store, API, webhooks with real Twilio signatures, alerts, replies, dispatch, Verify, triage, eval) |
 | `Dockerfile`, `docker-compose.yml`, `.github/workflows/ci.yml` | Containers and CI |
 
 ## Setup
@@ -111,11 +113,39 @@ curl -X POST localhost:8000/webhooks/twilio/messaging \
   -d From=+353871234567 -d Body="Water leaking through my ceiling onto the lights"
 ```
 
+## Live email (SendGrid Inbound Parse)
+
+1. Set `INBOUND_EMAIL_TOKEN` to a long random string.
+2. In SendGrid, add an Inbound Parse host (an MX record on a subdomain, e.g. `inbox.yourdomain.ie`) and set the destination URL to `{HEARTHLINE_PUBLIC_URL}/webhooks/sendgrid/inbound/{INBOUND_EMAIL_TOKEN}`.
+
+Each email becomes (or joins) a conversation with channel `email`; quoted earlier replies are stripped, attachments are listed by name, and Approve & Send replies by email. Emails are never auto-acknowledged, to avoid auto-reply loops.
+
+## Contractor dispatch
+
+Add contractors in the dashboard's **Contractors** panel (name, trade, mobile). In a thread, **Dispatch a contractor by text** sends: "Hearthline job 4821: Graylings, 2A: boiler broken. Reply YES 4821 to accept, NO 4821 to decline, DONE 4821 when finished." Replies arrive on the same Twilio webhook, are matched by the contractor's number, and update the job shown in the thread. A New conversation moves to In progress when a job is offered.
+
+## Login codes (Twilio Verify)
+
+Set `TWILIO_VERIFY_SERVICE_SID` and `HEARTHLINE_ADMIN_PHONE` (plus the Twilio credentials) and the dashboard asks for a texted 6-digit code after the password. Wrong codes count towards the same 5-attempt lockout. Login codes are never faked in dry-run: without real credentials the second step is simply off.
+
+## Measuring accuracy
+
+```bash
+python eval/evaluate.py init                    # writes eval/labels.csv (one row per sample thread)
+# fill in expected_tier (human / ai / auto) and optionally expected_urgency
+python eval/evaluate.py score                   # precision / recall / F1, confusion matrix -> eval/report.md
+python eval/evaluate.py score --compare 390e86c # the same numbers for the original hackathon code
+```
+
+Label from the messages, not from what the app shows, or the numbers just measure agreement with yourself.
+
+When an LLM is configured, it also gets a veto over auto-replies: if the keyword rules pick an FAQ template, the model is asked whether that canned answer really answers the resident; "no" moves the thread to the AI tier. If the model is unavailable the rules decide as before.
+
 ## Tests
 
 ```bash
 pytest
-python -m pyflakes *.py pages/*.py backend/*.py tests/*.py
+python -m pyflakes *.py pages/*.py backend/*.py eval/*.py tests/*.py
 ```
 
 GitHub Actions runs both on every push and pull request (Python 3.10 and 3.12), see `.github/workflows/ci.yml`.
@@ -133,6 +163,5 @@ Urgency combines issue type, safety/legal/repeat signals, vulnerability (baby, e
 ## Known limitations
 
 - Rule-based classification: unusual wording can still be misrouted. An LLM intent check for FAQ matching is on the roadmap (`REVIEW_AND_ROADMAP.md`).
-- The sample email dataset is static; live email ingestion (SendGrid Inbound Parse) is not built yet.
 - SQLite and the in-memory rate limiter assume a single API process. Use Postgres and a shared limiter (e.g. Redis) before scaling out.
-- The dashboard has a single shared login; per-user accounts and Twilio Verify OTP are on the roadmap.
+- The dashboard has a single shared login (with an optional Twilio Verify code); there are no per-user accounts or roles yet.

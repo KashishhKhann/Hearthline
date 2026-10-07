@@ -306,6 +306,32 @@ def fallback_human_context(thread_bundle: dict) -> str:
 # LLM-backed functions
 # ---------------------------------------------------------------------------
 
+def confirm_faq_intent(first_message: str, template_id: str, template_reply: str) -> bool | None:
+    """Ask the model whether a keyword-matched FAQ template really answers the resident.
+
+    Keywords can't tell "what's the wifi password?" from "the wifi has been down for a week
+    and I work from home". Returns True / False, or None if the model is unavailable or
+    unclear (the caller then keeps its deterministic decision).
+    """
+    system = (
+        "You check whether a canned FAQ reply fully answers a resident's message for an Irish "
+        "property-management team. Say no if the resident reports a fault, a complaint, a dispute, "
+        "something urgent or anything the canned reply does not address. " + _UNTRUSTED_NOTE
+    )
+    body = _truncate_thread_text(first_message, 2_000).replace("<thread_data>", "").replace("</thread_data>", "")
+    user = (
+        'Return ONLY a JSON object: {"answers": true or false, "reason": "<= 12 words"}\n\n'
+        f"FAQ topic: {template_id.replace('_', ' ')}\nCanned reply:\n{template_reply[:800]}\n\n"
+        f"<thread_data>\n{body}\n</thread_data>"
+    )
+    try:
+        data = _parse_json_object(_chat_completion(system, user, temperature=0.0))
+    except Exception:  # noqa: BLE001
+        return None
+    answers = data.get("answers")
+    return answers if isinstance(answers, bool) else None
+
+
 def analyze_thread(thread_bundle: dict) -> dict | None:
     """One model call per thread returning summary, action and (AI tier only) draft.
 

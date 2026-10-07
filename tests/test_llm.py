@@ -75,3 +75,14 @@ def test_circuit_breaker_stops_calls(monkeypatch):
 def test_bad_timeout_env_does_not_crash(monkeypatch):
     monkeypatch.setenv("LLM_TIMEOUT_S", "twenty")
     assert llm._llm_config()["timeout_s"] == 20.0
+
+
+def test_confirm_faq_intent(monkeypatch):
+    monkeypatch.setenv("LLM_BASE_URL", "http://fake/v1")
+    llm._cache.clear()
+    llm.reset_llm_state()
+    replies = iter(['{"answers": false, "reason": "reports an outage"}', '{"answers": true}', 'not json'])
+    monkeypatch.setattr(llm.requests, "post", lambda *a, **k: FakeResponse(next(replies)))
+    assert llm.confirm_faq_intent("wifi down for a week", "wifi", "WiFi details are in the guide") is False
+    assert llm.confirm_faq_intent("what is the wifi password?", "wifi", "WiFi details are in the guide") is True
+    assert llm.confirm_faq_intent("anything else", "wifi", "WiFi details are in the guide") is None

@@ -9,6 +9,7 @@ Public endpoints
     POST /webhooks/twilio/status          delivery status callbacks (Twilio-signed)
     POST /webhooks/twilio/voice/alert/ID  TwiML for an escalation call (Twilio-signed)
     POST /webhooks/twilio/voice/ack/ID    keypress result from that call (Twilio-signed)
+    POST /webhooks/sendgrid/inbound/TOKEN live email via SendGrid Inbound Parse
 
 Admin endpoints (header X-Admin-Key: $HEARTHLINE_ADMIN_API_KEY)
     PATCH /conversations/{id}/status
@@ -25,6 +26,7 @@ import os
 import re
 import uuid
 from contextlib import asynccontextmanager
+from email.utils import parseaddr
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +34,7 @@ from pydantic import BaseModel
 
 import store
 from backend import alerting
+from backend.dispatch import DispatchError, dispatch_job, handle_contractor_reply
 from backend.notify import Notifier
 from backend.replies import ReplyError, send_reply
 from backend.validation import (
@@ -208,7 +211,12 @@ async def inbound_message(background: BackgroundTasks, form: dict = Depends(twil
         store.set_opt_out(phone, False)
         return _twiml("")
 
-    # 3. A resident message: log it, triage it in the background, acknowledge.
+    # 3. A contractor answering a job offer: "YES 4821", "NO 4821", "DONE 4821".
+    contractor_reply = handle_contractor_reply(phone, text)
+    if contractor_reply is not None:
+        return _twiml(f"<Message>{_xml_escape(contractor_reply)}</Message>")
+
+    # 4. A resident message: log it, triage it in the background, acknowledge.
     media = [form[f"MediaUrl{i}"] for i in range(env_int("MAX_MEDIA", 10))
              if form.get(f"MediaUrl{i}")][: int(form.get("NumMedia") or 0)]
     conversation_id, is_new = store.record_inbound_message(
@@ -258,10 +266,65 @@ async def voice_ack(alert_id: str, form: dict = Depends(twilio_form)):
     return _twiml("<Say>Understood. We will contact the next person on call. Goodbye.</Say>")
 
 
+# ── Email (SendGrid Inbound Parse) ────────────────────────────────────────────
+
+MAX_EMAIL_CHARS = 20_000
+_QUOTE_START = re.compile(r"^(On .+ wrote:|-----Original Message-----|From: .+)$", re.IGNORECASE)
+
+
+def strip_quoted_reply(text: str) -> str:
+    """Keep only the new part of an email reply (drop '> quoted' lines and the quoted thread)."""
+    kept: list[str] = []
+    for line in (text or "").splitlines():
+        if _QUOTE_START.match(line.strip()):
+            break
+        if line.lstrip().startswith(">"):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
+@app.post("/webhooks/sendgrid/inbound/{token}")
+async def inbound_email(token: str, request: Request, background: BackgroundTasks):
+    """SendGrid Inbound Parse posts each received email here as multipart form data.
+
+    SendGrid doesn't sign these requests, so the URL carries a secret token
+    (INBOUND_EMAIL_TOKEN): configure the Parse URL as .../webhooks/sendgrid/inbound/<token>.
+    """
+    expected = os.getenv("INBOUND_EMAIL_TOKEN", "")
+    if not expected:
+        raise HTTPException(503, "Inbound email disabled: set INBOUND_EMAIL_TOKEN.")
+    if not hmac.compare_digest(token.encode(), expected.encode()):
+        raise HTTPException(403, "Invalid token.")
+    form = await request.form()
+    name, address = parseaddr(str(form.get("from") or ""))
+    address = address.strip().lower()
+    if "@" not in address:
+        raise HTTPException(400, "Missing sender address.")
+    subject = str(form.get("subject") or "").strip()
+    text = strip_quoted_reply(str(form.get("text") or ""))
+    if not text and form.get("html"):
+        text = re.sub(r"<[^>]+>", " ", str(form.get("html")))
+        text = re.sub(r"\s+", " ", text).strip()
+    body = (f"{subject}\n\n{text}" if subject else text)[:MAX_EMAIL_CHARS] or "(empty email)"
+    attachments = [str(getattr(f, "filename", "") or "") for k, f in form.multi_items()
+                   if k.startswith("attachment") and getattr(f, "filename", None)]
+    conversation_id, _ = store.record_inbound_message(address, body, "email", media_urls=attachments,
+                                                      display_name=name.strip())
+    background.add_task(alerting.maybe_alert, conversation_id)
+    # No auto-acknowledgement by email: auto-replies to auto-replies cause mail loops.
+    return {"ok": True, "id": conversation_id}
+
+
 # ── Admin endpoints ───────────────────────────────────────────────────────────
 
 class StatusUpdate(BaseModel):
     status: str
+
+
+class DispatchRequest(BaseModel):
+    contractor_id: str
+    note: str
 
 
 class ReplyRequest(BaseModel):
@@ -291,6 +354,14 @@ def reply(thread_id: str, request: ReplyRequest, actor: str = Depends(require_ad
     if not result.ok:
         raise HTTPException(502, result.error or "Send failed")
     return result.as_dict()
+
+
+@app.post("/threads/{thread_id}/dispatch")
+def dispatch(thread_id: str, request: DispatchRequest, actor: str = Depends(require_admin)):
+    try:
+        return dispatch_job(thread_id, request.contractor_id, request.note, actor)
+    except DispatchError as exc:
+        raise HTTPException(400, str(exc)) from None
 
 
 @app.post("/alerts/escalate")

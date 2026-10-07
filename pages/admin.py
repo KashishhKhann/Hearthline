@@ -14,7 +14,10 @@ from dotenv import load_dotenv
 from ui_compat import embed_html
 
 import store
+from backend.dispatch import DispatchError, dispatch_job
+from backend.notify import Notifier
 from backend.replies import ReplyError, reply_route, send_reply
+from backend.validation import normalize_phone
 from pipeline import DEFAULT_DATASET_PATH, run_pipeline
 
 _REPORT_STATUS_LABELS = {"new": "New", "in_progress": "In progress", "resolved": "Resolved"}
@@ -350,9 +353,47 @@ section[data-testid="stSidebar"],
 """
 
 
+def _second_factor_phone() -> str | None:
+    """Admin phone for one-time codes, when Twilio Verify is fully configured."""
+    phone = normalize_phone(os.getenv("HEARTHLINE_ADMIN_PHONE", ""))
+    return phone if phone and Notifier().verify_live else None
+
+
+def _render_second_factor(user: str) -> None:
+    phone = _second_factor_phone()
+    if not phone:  # config removed mid-login: start again
+        st.session_state.pop("pending_2fa_user", None)
+        st.rerun()
+    _, card_col, _ = st.columns([1, 2, 1])
+    with card_col:
+        st.markdown("<div style='height:18vh'></div>", unsafe_allow_html=True)
+        st.markdown(f"We texted a 6-digit code to the admin phone ending {_e(phone[-4:])}.", unsafe_allow_html=True)
+        code = st.text_input("Login code", max_chars=10, key="login_code")
+        verify_col, cancel_col = st.columns(2)
+        if verify_col.button("Verify", key="login_verify", use_container_width=True):
+            locked_for = _lockout_remaining(user)
+            if locked_for:
+                st.error(f"Too many failed attempts. Try again in {locked_for // 60 + 1} min.")
+            elif Notifier().check_verification(phone, code):
+                _failed_logins().pop(user.lower(), None)
+                st.session_state.pop("pending_2fa_user", None)
+                st.session_state.authenticated = True
+                st.session_state.auth_user = user
+                st.rerun()
+            else:
+                _record_failure(user)
+                st.error("That code didn't work. Check the latest text and try again.")
+        if cancel_col.button("Cancel", key="login_cancel", use_container_width=True):
+            st.session_state.pop("pending_2fa_user", None)
+            st.rerun()
+
+
 def _render_login() -> None:
     # Only load the minimal login stylesheet — NOT the full dashboard CSS
     st.markdown(_LOGIN_CSS, unsafe_allow_html=True)
+    if st.session_state.get("pending_2fa_user"):
+        _render_second_factor(st.session_state.pending_2fa_user)
+        return
 
     # ← Back to portal link
     st.markdown(
@@ -392,9 +433,17 @@ def _render_login() -> None:
                 error = f"Too many failed attempts. Try again in {locked_for // 60 + 1} min."
             elif _check_credentials(username, password):
                 _failed_logins().pop(username.strip().lower(), None)
-                st.session_state.authenticated = True
-                st.session_state.auth_user = username.strip()
-                st.rerun()
+                phone = _second_factor_phone()
+                if phone:
+                    started = Notifier().start_verification(phone)
+                    if started.ok:
+                        st.session_state.pending_2fa_user = username.strip()
+                        st.rerun()
+                    error = f"Could not send your login code: {started.error}"
+                else:
+                    st.session_state.authenticated = True
+                    st.session_state.auth_user = username.strip()
+                    st.rerun()
             else:
                 _record_failure(username)
                 error = "Incorrect username or password."
@@ -704,6 +753,85 @@ def _render_send(selected: pd.Series, body: str, emails_df: pd.DataFrame) -> Non
         st.rerun()
 
 
+_JOB_LABELS = {"offered": "offered, waiting for reply", "accepted": "accepted", "declined": "declined",
+               "done": "done"}
+
+
+def _render_jobs(selected: pd.Series) -> None:
+    """Contractor dispatch: offer the job by SMS, see who accepted."""
+    thread_id = str(selected.get("thread_id", ""))
+    jobs = store.jobs_for_thread(thread_id)
+    contractors = store.list_contractors()
+    if not jobs and not contractors:
+        return
+    st.markdown(_label("Contractor"), unsafe_allow_html=True)
+    for j in jobs:
+        st.markdown(
+            f'<div style="font-size:12px;color:#4A4A3F">Job {_e(j["code"])} · {_e(j["contractor_name"])} '
+            f'({_e(j["contractor_trade"] or "contractor")}) · {_e(_JOB_LABELS.get(j["status"], j["status"]))}'
+            f'{" · " + _e(j["responded_at"]) if j["responded_at"] else ""}</div>',
+            unsafe_allow_html=True,
+        )
+    flash_key = f"job_flash_{thread_id}"
+    if flash_key in st.session_state:
+        kind, text = st.session_state.pop(flash_key)
+        (st.success if kind == "ok" else st.error)(text)
+    if not contractors:
+        st.caption("Add contractors in the Contractors panel above to dispatch jobs by text.")
+        return
+    if any(j["status"] in ("offered", "accepted") for j in jobs):
+        return
+    with st.expander("Dispatch a contractor by text"):
+        options = {f'{c["name"]} · {c["trade"] or "contractor"}': c["id"] for c in contractors}
+        choice = st.selectbox("Contractor", list(options), key=f"job_pick_{thread_id}")
+        building = str(selected.get("property_name", "") or "")
+        building = "" if building == "Unknown Property" else building
+        conversation_id = store.conversation_id_from_thread(thread_id)
+        conv = store.get_conversation(conversation_id) if conversation_id else None
+        unit = (conv or {}).get("unit") or ""
+        where = ", ".join(x for x in [building, unit] if x)
+        subject = str(selected.get("subject", "") or "").split(": ", 1)[-1][:120]
+        default_note = f"{where}: {subject}" if where else subject
+        note = st.text_area("Job description (sent to the contractor)", value=default_note,
+                            key=f"job_note_{thread_id}", height=80)
+        if st.button("Text job offer", key=f"job_send_{thread_id}"):
+            try:
+                job = dispatch_job(thread_id, options[choice], note, _actor())
+            except DispatchError as exc:
+                st.session_state[flash_key] = ("error", str(exc))
+            else:
+                dry = " (dry run, nothing actually sent)" if job["dry_run"] else ""
+                st.session_state[flash_key] = ("ok", f"Job {job['code']} offered to {job['contractor']}{dry}.")
+            st.rerun()
+
+
+def _render_contractors_admin() -> None:
+    contractors = store.list_contractors(active_only=False)
+    if contractors:
+        for c in contractors:
+            cols = st.columns([5, 2])
+            cols[0].markdown(f'{_e(c["name"])} · {_e(c["trade"] or "contractor")} · `{_e(c["phone"])}`'
+                             f'{"" if c["active"] else " · inactive"}', unsafe_allow_html=True)
+            label = "Deactivate" if c["active"] else "Reactivate"
+            if cols[1].button(label, key=f"contractor_toggle_{c['id']}", use_container_width=True):
+                store.set_contractor_active(c["id"], not c["active"])
+                st.rerun()
+    else:
+        st.caption("No contractors yet.")
+    with st.form("add_contractor", clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        name = c1.text_input("Name")
+        trade = c2.text_input("Trade", placeholder="Plumber")
+        phone = c3.text_input("Mobile", placeholder="087 123 4567")
+        if st.form_submit_button("Add contractor"):
+            normalized = normalize_phone(phone)
+            if not name.strip() or not normalized:
+                st.error("Enter a name and a valid mobile number.")
+            else:
+                store.add_contractor(name, trade, normalized)
+                st.rerun()
+
+
 def _render_alerts(thread_id: str) -> None:
     alerts = store.alerts_for_thread(thread_id)
     if not alerts:
@@ -807,6 +935,7 @@ def _render_thread_detail(selected: pd.Series, emails_df: pd.DataFrame) -> None:
             st.markdown('<div style="font-size:13px;color:#4A4A3F">No draft reply generated.</div>', unsafe_allow_html=True)
 
     _render_alerts(str(selected.get("thread_id", "")))
+    _render_jobs(selected)
 
     st.markdown(_label("Message Timeline"), unsafe_allow_html=True)
     _render_timeline(str(selected.get("thread_id","")), emails_df)
@@ -903,6 +1032,8 @@ _render_metrics(thread_df)
 st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 with st.expander("Portfolio Themes", expanded=False):
     _render_themes(themes_df)
+with st.expander("Contractors", expanded=False):
+    _render_contractors_admin()
 st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 
 filters  = _render_filters(thread_df)

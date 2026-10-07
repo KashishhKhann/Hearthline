@@ -289,3 +289,118 @@ def test_inbound_sender_normalised(client):
     signed_post(client, "/webhooks/twilio/messaging", {"From": "0871234567", "Body": "Still off"})
     convs = store.conversations_with_messages()
     assert len(convs) == 1 and convs[0]["contact"] == "+353871234567"
+
+
+# ── Inbound email (SendGrid Inbound Parse) ────────────────────────────────────
+
+def test_inbound_email_requires_token(client, monkeypatch):
+    assert client.post("/webhooks/sendgrid/inbound/x", data={"from": "a@b.ie"}).status_code == 503
+    monkeypatch.setenv("INBOUND_EMAIL_TOKEN", "secret")
+    assert client.post("/webhooks/sendgrid/inbound/wrong", data={"from": "a@b.ie"}).status_code == 403
+
+
+def test_inbound_email_threads_strips_quotes_and_replies_by_email(client, monkeypatch):
+    monkeypatch.setenv("INBOUND_EMAIL_TOKEN", "secret")
+    first = {"from": "Ann Lee <Ann@Example.ie>", "subject": "Broken intercom",
+             "text": "The intercom is dead.\n\nOn Mon, Ann wrote:\n> old stuff"}
+    r = client.post("/webhooks/sendgrid/inbound/secret", data=first,
+                    files={"attachment1": ("photo.jpg", b"jpeg", "image/jpeg")})
+    assert r.status_code == 200
+    client.post("/webhooks/sendgrid/inbound/secret",
+                data={"from": "ann@example.ie", "subject": "Re: Broken intercom", "text": "Still dead\n> quoted"})
+    convs = store.conversations_with_messages()
+    assert len(convs) == 1
+    conv = convs[0]
+    assert conv["channel"] == "email" and conv["contact"] == "ann@example.ie" and conv["name"] == "Ann Lee"
+    assert conv["messages"][0]["body"] == "Broken intercom\n\nThe intercom is dead."
+    assert conv["messages"][0]["media_urls"] == ["photo.jpg"]
+    assert "quoted" not in conv["messages"][1]["body"]
+    fake = FakeNotifier()
+    result = send_reply(f"conv_{conv['id']}", "We're on it", "sarah", notifier=fake)
+    assert result.channel == "email" and fake.sent[0][:2] == ("email", "ann@example.ie")
+
+
+# ── Contractor dispatch ───────────────────────────────────────────────────────
+
+def test_dispatch_and_contractor_replies(client):
+    from backend.dispatch import DispatchError, dispatch_job
+
+    cid, _ = store.record_inbound_message("+353871234567", "Boiler broken", "sms")
+    plumber = store.add_contractor("Pat Plumbing", "Plumber", "+353861112222")
+    fake = FakeNotifier()
+    job = dispatch_job(f"conv_{cid}", plumber, "Graylings 2A: boiler broken", "sarah", notifier=fake)
+    assert fake.sent[0][1] == "+353861112222" and f"YES {job['code']}" in fake.sent[0][2]
+    assert store.get_conversation(cid)["status"] == "in_progress"
+
+    r = signed_post(client, "/webhooks/twilio/messaging", {"From": "+353861112222", "Body": f"yes {job['code']}"})
+    assert "is yours" in twiml_text(r)
+    assert store.jobs_for_thread(f"conv_{cid}")[0]["status"] == "accepted"
+    r = signed_post(client, "/webhooks/twilio/messaging", {"From": "+353861112222", "Body": "DONE 0000"})
+    assert "no open job" in twiml_text(r)
+    r = signed_post(client, "/webhooks/twilio/messaging", {"From": "+353861112222", "Body": f"Done {job['code']}"})
+    assert "marked as done" in twiml_text(r)
+    r = signed_post(client, "/webhooks/twilio/messaging", {"From": "+353861112222", "Body": "running late"})
+    assert "reply YES, NO or DONE" in twiml_text(r)
+    assert len(store.conversations_with_messages()) == 1  # contractor texts never become resident conversations
+    with pytest.raises(DispatchError):
+        dispatch_job(f"conv_{cid}", "missing", "x", "sarah", notifier=fake)
+
+
+def test_contractor_declines(client):
+    from backend.dispatch import dispatch_job
+
+    cid, _ = store.record_inbound_message("+353871234567", "Leak", "sms")
+    sparky = store.add_contractor("Sean Sparks", "Electrician", "+353863334444")
+    job = dispatch_job(f"conv_{cid}", sparky, "Leak near lights", "sarah", notifier=FakeNotifier())
+    r = signed_post(client, "/webhooks/twilio/messaging", {"From": "+353863334444", "Body": f"no {job['code']}"})
+    assert "passed back" in twiml_text(r)
+    assert store.jobs_for_thread(f"conv_{cid}")[0]["status"] == "declined"
+
+
+# ── Twilio Verify login codes ─────────────────────────────────────────────────
+
+class _FakeVerifyClient:
+    def __init__(self):
+        self.calls = []
+        outer = self
+
+        class _Verifications:
+            def create(self, to, channel):
+                outer.calls.append(("start", to, channel))
+                return type("V", (), {"sid": "VE1", "status": "pending"})()
+
+        class _Checks:
+            def create(self, to, code):
+                outer.calls.append(("check", to, code))
+                return type("C", (), {"status": "approved" if code == "123456" else "pending"})()
+
+        class _Service:
+            verifications = _Verifications()
+            verification_checks = _Checks()
+
+        class _V2:
+            def services(self, sid):
+                outer.calls.append(("service", sid))
+                return _Service()
+
+        self.verify = type("Verify", (), {"v2": _V2()})()
+
+
+def test_verify_codes(monkeypatch):
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "AC1")
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "t")
+    monkeypatch.setenv("TWILIO_VERIFY_SERVICE_SID", "VA1")
+    client = _FakeVerifyClient()
+    notifier = Notifier(client=client)
+    assert notifier.verify_live
+    assert notifier.start_verification("+353861112222").ok
+    assert notifier.check_verification("+353861112222", "123456")
+    assert not notifier.check_verification("+353861112222", "999999")
+    assert ("start", "+353861112222", "sms") in client.calls
+
+
+def test_verify_never_faked_without_credentials():
+    notifier = Notifier()
+    assert not notifier.verify_live
+    assert not notifier.start_verification("+353861112222").ok
+    assert not notifier.check_verification("+353861112222", "000000")

@@ -9,6 +9,7 @@ Environment:
     TWILIO_FROM_NUMBER       SMS / voice sender, e.g. +3531234567
     TWILIO_WHATSAPP_FROM     e.g. whatsapp:+14155238886 (the Twilio sandbox number)
     SENDGRID_API_KEY, SENDGRID_FROM_EMAIL
+    TWILIO_VERIFY_SERVICE_SID  for one-time login codes (Twilio Verify)
     HEARTHLINE_DRY_RUN       1 to force dry-run even with credentials
 """
 from __future__ import annotations
@@ -47,6 +48,7 @@ class Notifier:
         self.whatsapp_from = os.getenv("TWILIO_WHATSAPP_FROM", "").strip()
         self.sendgrid_key = os.getenv("SENDGRID_API_KEY", "").strip()
         self.sendgrid_from = os.getenv("SENDGRID_FROM_EMAIL", "").strip()
+        self.verify_sid = os.getenv("TWILIO_VERIFY_SERVICE_SID", "").strip()
         self.force_dry_run = os.getenv("HEARTHLINE_DRY_RUN", "").strip() in {"1", "true", "yes"}
         self._client = client
 
@@ -54,6 +56,11 @@ class Notifier:
     @property
     def twilio_live(self) -> bool:
         return not self.force_dry_run and bool(self.account_sid and self.auth_token and self.from_number)
+
+    @property
+    def verify_live(self) -> bool:
+        """Login codes need real credentials: a security check is never faked in dry-run."""
+        return bool(self.account_sid and self.auth_token and self.verify_sid)
 
     @property
     def email_live(self) -> bool:
@@ -114,3 +121,25 @@ class Notifier:
             log.warning("SendGrid send failed to %s: %s", to, exc)
             return SendResult(ok=False, sid=None, status="failed", error=str(exc))
         return SendResult(ok=True, sid=response.headers.get("X-Message-Id"), status="sent")
+
+    # ── One-time login codes (Twilio Verify) ─────────────────────────────────
+    def start_verification(self, to: str) -> SendResult:
+        if not self.verify_live:
+            return SendResult(ok=False, sid=None, status="failed", error="Twilio Verify is not configured.")
+        try:
+            v = self._twilio().verify.v2.services(self.verify_sid).verifications.create(to=to, channel="sms")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Verify start failed for %s: %s", to, exc)
+            return SendResult(ok=False, sid=None, status="failed", error=str(exc))
+        return SendResult(ok=True, sid=getattr(v, "sid", None), status=str(getattr(v, "status", "pending")))
+
+    def check_verification(self, to: str, code: str) -> bool:
+        if not self.verify_live or not code.strip():
+            return False
+        try:
+            check = self._twilio().verify.v2.services(self.verify_sid).verification_checks.create(
+                to=to, code=code.strip())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Verify check failed for %s: %s", to, exc)
+            return False
+        return getattr(check, "status", "") == "approved"

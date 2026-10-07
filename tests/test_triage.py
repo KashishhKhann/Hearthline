@@ -122,3 +122,25 @@ def test_emergencies_described_without_the_word_leak(dataset, body):
     t, _ = run(dataset, [make_email(1, "t1", subject="Help", body=body)])
     assert t.loc["t1", "issue_type"] == "emergency_maintenance"
     assert t.loc["t1", "urgency_label"] in {"high", "critical"}
+
+
+def test_llm_can_veto_an_auto_reply(dataset, monkeypatch):
+    import pipeline
+
+    monkeypatch.setattr(pipeline, "llm_is_available", lambda: True)
+    monkeypatch.setattr(pipeline, "analyze_thread", lambda bundle: None)
+    monkeypatch.setenv("LLM_BASE_URL", "http://fake/v1")
+    emails = [make_email(1, "t1", subject="Wifi", body="Hi, what is the wifi password? Thanks")]
+    path = dataset(emails)
+
+    def run_llm():
+        threads, *_ = pipeline.run_pipeline(dataset_path=path, llm_enabled=True, db_path=None)
+        return threads.set_index("thread_id")
+
+    monkeypatch.setattr(pipeline, "confirm_faq_intent", lambda *a: False)
+    t = run_llm()
+    assert t.loc["t1", "tier"] == "ai"
+    assert "model judged" in t.loc["t1", "reasoning"]
+    monkeypatch.setattr(pipeline, "confirm_faq_intent", lambda *a: None)  # model down: keep the rule's decision
+    t = run_llm()
+    assert t.loc["t1", "tier"] == "auto"

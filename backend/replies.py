@@ -37,6 +37,8 @@ def reply_route(thread_id: str, fallback_email: str | None = None, db_path=None)
     if conv is None:
         raise ReplyError("Conversation not found.")
     channel = conv["channel"]
+    if channel == "email":
+        return "email", conv["contact"]
     if channel in {"sms", "whatsapp"}:
         if store.is_opted_out(conv["phone"] or conv["contact"].removeprefix("whatsapp:"), db_path):
             raise ReplyError("This resident replied STOP, so we can't text them.")

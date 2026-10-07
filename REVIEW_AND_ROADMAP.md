@@ -235,3 +235,14 @@ Roadmap items 3 (real backend) and most of section 4 (Twilio) are now built.
 - **Tests:** 93 passing, including webhooks signed with Twilio's real `RequestValidator`, tampered-signature rejection, the full alert → no ACK → voice call → press 1 flow, STOP blocking replies, and consent-based channel choice. Browser-checked: portal with phone + consent, inbound SMS showing in the dashboard with its alerts, Approve & Send (dry run) recording the outbound message.
 
 **Still open:** 4.4 SendGrid Inbound Parse (live email), 4.5 contractor dispatch by SMS, 4.6 Twilio Verify login, the labelled eval set, and the LLM intent check for auto-replies.
+
+### Round 5 (7 Oct 2026)
+
+- **Eval tooling** (`eval/evaluate.py`): `init` writes `eval/labels.csv` (92 threads, first sender, subject, start of the first message) for hand-labelling; `score` prints per-tier precision/recall/F1, a confusion matrix, urgency agreement and every disagreement, and saves `eval/report.md`; `--compare <commit>` scores an older version in a temporary git worktree for before/after numbers. The labels themselves are yours to fill in.
+- **LLM veto on auto-replies:** when a model is configured, it confirms that a keyword-matched FAQ template really answers the message; "no" moves the thread to AI. If the model is down, the rules decide.
+- **Live email (4.4):** token-protected SendGrid Inbound Parse webhook. Emails thread by sender, quoted history is stripped, attachments listed, replies go out by email, no auto-acknowledgements (mail-loop safe).
+- **Contractor dispatch (4.5):** contractors table managed in the dashboard; "Text job offer" sends a 4-digit job code; YES / NO / DONE replies on the same webhook update the job; contractor texts never become resident conversations.
+- **Twilio Verify login (4.6):** optional texted code after the password, counted in the same lockout, never faked in dry-run.
+- **Tests:** 102 passing. CI lints `eval/` too.
+
+Open: the alert-escalation question (keep ringing the rota after an unanswered call, or leave it open as now), Postgres for multi-process deployments, per-user dashboard accounts.

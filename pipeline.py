@@ -14,6 +14,7 @@ from escalation import detect_human_required
 from ingest import group_emails_by_thread, load_and_prepare
 from llm import (
     analyze_thread,
+    confirm_faq_intent,
     fallback_action,
     fallback_action_owner,
     fallback_draft_reply,
@@ -335,6 +336,13 @@ def analyze_threads(
                 and issue_type in AUTO_ELIGIBLE_ISSUES
                 and sentiment in AUTO_ELIGIBLE_SENTIMENTS
             )
+            if auto_allowed and llm_enabled_effective:
+                # Second opinion: keywords matched an FAQ, but does the canned answer really fit?
+                verdict = confirm_faq_intent(base_bundle["first_inbound_text"], auto.get("template_id") or "",
+                                             auto.get("draft_reply", ""))
+                if verdict is False:
+                    auto_allowed = False
+                    reasons.append("FAQ keyword matched but the model judged the template doesn't answer it")
             if auto_allowed:
                 tier = "auto"
                 handling_reason = auto.get("handling_reason", "FAQ match")

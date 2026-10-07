@@ -87,6 +87,29 @@ CREATE TABLE IF NOT EXISTS alerts (
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_thread ON alerts(thread_id);
 
+CREATE TABLE IF NOT EXISTS contractors (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    trade           TEXT NOT NULL DEFAULT '',
+    phone           TEXT NOT NULL UNIQUE,  -- E.164
+    active          INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS jobs (
+    id              TEXT PRIMARY KEY,
+    code            TEXT NOT NULL,          -- 4 digits the contractor quotes: "YES 4821"
+    thread_id       TEXT NOT NULL,
+    contractor_id   TEXT NOT NULL REFERENCES contractors(id),
+    note            TEXT NOT NULL,
+    status          TEXT NOT NULL,          -- offered | accepted | declined | done
+    provider_sid    TEXT,
+    offered_by      TEXT,
+    offered_at      TEXT NOT NULL,
+    responded_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_thread ON jobs(thread_id);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     at              TEXT NOT NULL,
@@ -265,13 +288,15 @@ def create_report(report: dict, path: Path | str | None = None, *, channel: str 
 
 
 def record_inbound_message(contact: str, body: str, channel: str, *, media_urls: list[str] | None = None,
-                           provider_sid: str | None = None, path: Path | str | None = None) -> tuple[str, bool]:
+                           provider_sid: str | None = None, path: Path | str | None = None,
+                           display_name: str = "") -> tuple[str, bool]:
     """Attach an inbound SMS/WhatsApp to the contact's open conversation, or start a new one.
 
     Returns (conversation_id, is_new_conversation).
     """
     ts = now_iso()
-    phone = contact.removeprefix("whatsapp:")
+    is_email = channel == "email"
+    phone = "" if is_email else contact.removeprefix("whatsapp:")
     with connect(path) as conn:
         row = conn.execute(
             "SELECT id, updated_at FROM conversations WHERE contact = ? AND status != 'resolved'"
@@ -282,12 +307,14 @@ def record_inbound_message(contact: str, body: str, channel: str, *, media_urls:
         is_new = row is None or updated is None or datetime.now(timezone.utc) - updated > REOPEN_WINDOW
         if is_new:
             conversation_id = str(uuid.uuid4())
-            known = conn.execute("SELECT * FROM residents WHERE phone = ?", (phone,)).fetchone()
+            known = (conn.execute("SELECT * FROM residents WHERE lower(email) = lower(?) LIMIT 1", (contact,)).fetchone()
+                     if is_email else conn.execute("SELECT * FROM residents WHERE phone = ?", (phone,)).fetchone())
             conn.execute(
                 "INSERT INTO conversations (id, channel, contact, name, email, phone, unit, property_name,"
                 " status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)",
-                (conversation_id, channel, contact, known["name"] if known else "",
-                 known["email"] if known else "", phone, known["unit"] if known else "",
+                (conversation_id, channel, contact, known["name"] if known else display_name,
+                 contact if is_email else (known["email"] if known else ""), phone or (known["phone"] if known else ""),
+                 known["unit"] if known else "",
                  known["property_name"] if known else "", ts, ts),
             )
             audit(conn, "resident", "conversation_started", thread_id_for(conversation_id), {"channel": channel})
@@ -449,6 +476,90 @@ def sms_alerts_due_for_escalation(older_than: timedelta, path: Path | str | None
 def mark_escalated(alert_id: str, path: Path | str | None = None) -> None:
     with connect(path) as conn:
         conn.execute("UPDATE alerts SET escalated_at = ? WHERE id = ?", (now_iso(), alert_id))
+
+
+# ── Contractors & jobs ────────────────────────────────────────────────────────
+
+JOB_STATUSES = ("offered", "accepted", "declined", "done")
+OPEN_JOB_STATUSES = ("offered", "accepted")
+
+
+def add_contractor(name: str, trade: str, phone: str, path: Path | str | None = None) -> str:
+    contractor_id = str(uuid.uuid4())
+    with connect(path) as conn:
+        conn.execute(
+            "INSERT INTO contractors (id, name, trade, phone, active, created_at) VALUES (?, ?, ?, ?, 1, ?)"
+            " ON CONFLICT(phone) DO UPDATE SET name = excluded.name, trade = excluded.trade, active = 1",
+            (contractor_id, name.strip(), trade.strip(), phone, now_iso()),
+        )
+        row = conn.execute("SELECT id FROM contractors WHERE phone = ?", (phone,)).fetchone()
+        audit(conn, "manager", "contractor_saved", None, {"name": name, "phone": phone})
+    return row["id"]
+
+
+def set_contractor_active(contractor_id: str, active: bool, path: Path | str | None = None) -> None:
+    with connect(path) as conn:
+        conn.execute("UPDATE contractors SET active = ? WHERE id = ?", (int(active), contractor_id))
+
+
+def list_contractors(active_only: bool = True, path: Path | str | None = None) -> list[dict]:
+    query = "SELECT * FROM contractors" + (" WHERE active = 1" if active_only else "") + " ORDER BY trade, name"
+    with connect(path) as conn:
+        return [dict(r) for r in conn.execute(query)]
+
+
+def contractor_by_phone(phone: str, path: Path | str | None = None) -> dict | None:
+    with connect(path) as conn:
+        row = conn.execute("SELECT * FROM contractors WHERE phone = ? AND active = 1", (phone,)).fetchone()
+    return dict(row) if row else None
+
+
+def create_job(thread_id: str, contractor_id: str, code: str, note: str, status: str, provider_sid: str | None,
+               offered_by: str, path: Path | str | None = None) -> str:
+    job_id = str(uuid.uuid4())
+    with connect(path) as conn:
+        conn.execute(
+            "INSERT INTO jobs (id, code, thread_id, contractor_id, note, status, provider_sid, offered_by, offered_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (job_id, code, thread_id, contractor_id, note, status, provider_sid, offered_by, now_iso()),
+        )
+        audit(conn, offered_by, "job_offered", thread_id, {"code": code, "contractor_id": contractor_id})
+    return job_id
+
+
+def open_job_codes(path: Path | str | None = None) -> set[str]:
+    with connect(path) as conn:
+        rows = conn.execute("SELECT code FROM jobs WHERE status IN ('offered', 'accepted')").fetchall()
+    return {r["code"] for r in rows}
+
+
+def find_open_job(code: str, contractor_id: str, path: Path | str | None = None) -> dict | None:
+    with connect(path) as conn:
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE code = ? AND contractor_id = ? AND status IN ('offered', 'accepted')"
+            " ORDER BY offered_at DESC LIMIT 1",
+            (code, contractor_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def update_job_status(job_id: str, status: str, actor: str, path: Path | str | None = None) -> None:
+    if status not in JOB_STATUSES:
+        raise ValueError(f"Invalid job status: {status}")
+    with connect(path) as conn:
+        conn.execute("UPDATE jobs SET status = ?, responded_at = ? WHERE id = ?", (status, now_iso(), job_id))
+        row = conn.execute("SELECT thread_id, code FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        audit(conn, actor, f"job_{status}", row["thread_id"], {"code": row["code"]})
+
+
+def jobs_for_thread(thread_id: str, path: Path | str | None = None) -> list[dict]:
+    with connect(path) as conn:
+        rows = conn.execute(
+            "SELECT j.*, c.name AS contractor_name, c.trade AS contractor_trade, c.phone AS contractor_phone"
+            " FROM jobs j JOIN contractors c ON c.id = j.contractor_id WHERE j.thread_id = ? ORDER BY j.offered_at",
+            (thread_id,),
+        )
+        return [dict(r) for r in rows]
 
 
 # ── Migration from the old JSON file ──────────────────────────────────────────
