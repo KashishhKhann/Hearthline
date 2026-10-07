@@ -1,4 +1,3 @@
-import pytest
 from scoring import classify_issue, score_urgency, label_urgency
 
 
@@ -17,7 +16,9 @@ class TestClassifyIssue:
         assert classify_issue("deposit refund requested") == "financial"
 
     def test_leasing_signals(self):
-        assert classify_issue("viewing request for unit 3") == "leasing"
+        # Viewing requests are sales leads, routed to the leasing team as "prospect".
+        assert classify_issue("viewing request for unit 3") == "prospect"
+        assert classify_issue("lease renewal for next year") == "leasing"
 
     def test_move_out_signals(self):
         assert classify_issue("tenant wants to vacate end of month") == "move_out"

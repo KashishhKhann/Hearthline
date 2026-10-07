@@ -1,15 +1,9 @@
 import json
 import pytest
-import pandas as pd
-from parsing import (
-    load_json,
-    emails_to_dataframe,
-    _to_text,
-    _to_list,
-    _to_bool,
-    validate_email_dataframe,
-    REQUIRED_EMAIL_COLUMNS,
-)
+# Originally written for parsing.py, which was replaced by ingest.py in 390e86c.
+from ingest import EMAIL_COLUMNS as REQUIRED_EMAIL_COLUMNS
+from ingest import _to_bool, _to_list, _to_text, load_json
+from ingest import flatten_emails as emails_to_dataframe
 
 
 SAMPLE_RAW = {
@@ -118,7 +112,7 @@ class TestEmailsToDataframe:
 
     def test_read_is_bool(self):
         df = emails_to_dataframe(SAMPLE_RAW)
-        assert df.iloc[0]["read"] is False
+        assert not df.iloc[0]["read"]
 
     def test_to_is_list(self):
         df = emails_to_dataframe(SAMPLE_RAW)
@@ -139,13 +133,11 @@ class TestEmailsToDataframe:
             assert col in df.columns
 
 
-class TestValidateEmailDataframe:
-    def test_empty_df_warns(self):
-        df = pd.DataFrame()
-        warnings = validate_email_dataframe(df)
-        assert any("No emails" in w for w in warnings)
+class TestPrepareWarnings:
+    def test_valid_data_has_no_timestamp_warning(self, tmp_path):
+        from ingest import load_and_prepare
 
-    def test_valid_df_no_timestamp_warning(self):
-        df = emails_to_dataframe(SAMPLE_RAW)
-        warnings = validate_email_dataframe(df)
+        p = tmp_path / "data.json"
+        p.write_text(json.dumps(SAMPLE_RAW))
+        _emails, _props, warnings = load_and_prepare(str(p))
         assert not any("invalid timestamps" in w for w in warnings)

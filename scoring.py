@@ -130,6 +130,9 @@ VENDOR_TERMS = {
 MOVE_OUT_TERMS = {
     "move out",
     "move-out",
+    "moving out",
+    "checkout",
+    "check out",
     "vacate",
     "check-out",
     "handover",

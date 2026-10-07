@@ -76,8 +76,8 @@ def _to_list(value: Any) -> list[str]:
         return []
     if ";" in text:
         return [part.strip() for part in text.split(";") if part.strip()]
-    # Only split on commas between addresses, not inside names like "Doe, Jane <j@x.ie>".
-    if "," in text and text.count("@") > 1:
+    # Split on commas, except a single address whose display name has one ("Doe, Jane <j@x.ie>").
+    if "," in text and text.count("@") != 1:
         return [part.strip() for part in text.split(",") if part.strip()]
     return [text]
 

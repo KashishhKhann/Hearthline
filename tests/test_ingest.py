@@ -76,3 +76,7 @@ def test_replied_sms_messages_count_as_read(dataset, tmp_path):
     threads, *_ = run_pipeline(dataset_path=dataset([make_email(1, "t1")]), llm_enabled=False, db_path=str(db))
     row = threads.set_index("thread_id").loc[f"conv_{conv_id}"]
     assert row.unread_count == 0 and row.email_count == 2
+
+
+def test_to_list_splits_plain_names():
+    assert _to_list("a, b, c") == ["a", "b", "c"]
