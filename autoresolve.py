@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from constants import contains_word
+
 
 FAQ_FALLBACK_PATTERNS = {
     "wifi": ["wifi", "wi-fi", "internet password", "broadband"],
@@ -24,6 +26,24 @@ STRONG_URGENCY_TERMS = {
     "legal",
     "dispute",
     "still not fixed",
+    "flood",
+    "burst pipe",
+    "water coming through",
+    "water pouring",
+    "gas",
+    "carbon monoxide",
+    "sparking",
+    "no electricity",
+    "no power",
+    # pests / hygiene: never answer these with a canned FAQ
+    "cockroach",
+    "cockroaches",
+    "rats",
+    "rat",
+    "mice",
+    "pest",
+    "pests",
+    "vermin",
 }
 
 
@@ -55,8 +75,9 @@ def match_faq_template(subject: str, body: str, templates: dict) -> str | None:
     if not patterns_by_template:
         patterns_by_template = FAQ_FALLBACK_PATTERNS
 
+    # Word-boundary matching: "bin" must not match "plumbing", "combined", "cabinet".
     for template_id, patterns in patterns_by_template.items():
-        if any(pattern in text for pattern in patterns):
+        if contains_word(text, set(patterns)):
             return template_id
 
     return None
@@ -97,7 +118,10 @@ def render_template_reply(template_id: str, context: dict, templates: dict) -> s
 
 def evaluate_auto_resolve(thread_bundle: dict, templates: dict) -> dict:
     subject = str(thread_bundle.get("subject", "") or "")
-    body = str(thread_bundle.get("thread_text", "") or "")
+    full_text = str(thread_bundle.get("thread_text", "") or "")
+    # Match the FAQ intent against the resident's own first message only, not
+    # staff/contractor replies further down the thread.
+    body = str(thread_bundle.get("first_inbound_text") or full_text)
 
     template_id = match_faq_template(subject, body, templates)
     if not template_id:
@@ -109,8 +133,9 @@ def evaluate_auto_resolve(thread_bundle: dict, templates: dict) -> dict:
             "strong_signal_present": False,
         }
 
-    text = _content_text(subject, body)
-    strong_signal_present = any(term in text for term in STRONG_URGENCY_TERMS)
+    # Strong signals anywhere in the thread block auto-resolve.
+    text = _content_text(subject, full_text)
+    strong_signal_present = contains_word(text, STRONG_URGENCY_TERMS)
 
     context = {
         "first_name": _first_name(str(thread_bundle.get("latest_sender_name", "") or "")),

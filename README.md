@@ -1,89 +1,138 @@
-# Lette Inbox Triage (Hackathon MVP)
+# Hearthline Inbox Triage
 
-Local Python + Streamlit app that triages property-management email threads into 3 handling tiers:
-- `auto` (auto-resolve with templates)
-- `ai` (AI draft ready)
-- `human` (human required, no customer-facing draft)
+Python + Streamlit app that triages property-management email threads and resident reports into three handling tiers:
 
-The app uses deterministic ingestion/tiering/scoring and optional local LLM enrichments through an OpenAI-compatible chat completions interface.
+- `human`: needs a person (legal/RTB, media, welfare, repeat unresolved issues). No customer-facing draft.
+- `ai`: an AI (or template) draft is prepared for a manager to review and send.
+- `auto`: a simple resident FAQ (wifi, bins, parking, direct debit, move-in) answered from `templates.json`.
 
-## Project Structure
-- `app.py`
-- `ingest.py`
-- `escalation.py`
-- `autoresolve.py`
-- `scoring.py`
-- `llm.py`
-- `themes.py`
-- `pipeline.py`
-- `templates.json`
-- `requirements.txt`
-- `README.md`
+Rules are deterministic and explainable (every thread shows its scoring reasoning). An optional OpenAI-compatible LLM adds summaries, next actions and reply drafts; when it is unavailable the app falls back to deterministic text.
+
+## Architecture
+
+```
+ Resident portal (Streamlit, app.py) ──POST /reports──┐
+ SMS / WhatsApp ──Twilio webhook──────────────────────┤
+                                                      ▼
+                         FastAPI (backend/main.py) ──► SQLite (store.py)
+                           │  validate, rate-limit,        conversations, messages,
+                           │  triage new message,          residents + consent,
+                           │  alert on-call if critical    alerts, audit log
+                           ▼                                  ▲
+                Twilio SMS ─► no ACK in 10 min ─► voice call  │
+                                                              │
+ Manager dashboard (Streamlit, pages/admin.py) ───────────────┘
+   triage pipeline over sample emails + stored conversations,
+   status changes, Approve & Send (SMS / WhatsApp / SendGrid email), activity log
+```
+
+## Project structure
+
+| File | Role |
+|---|---|
+| `app.py` | Resident portal ("Report an Issue" form with voice dictation, optional mobile + SMS consent) |
+| `pages/admin.py` | Manager dashboard (login, metrics, themes, paginated inbox, thread detail, Approve & Send, alerts, activity log) |
+| `backend/main.py` | FastAPI app: reports, Twilio webhooks (messaging, delivery status, voice), admin endpoints, escalation loop |
+| `backend/alerting.py` | Single-conversation triage, on-call SMS alerts, voice escalation |
+| `backend/replies.py` | Picks the reply channel (SMS, WhatsApp or email, respecting consent and STOP) and sends |
+| `backend/notify.py` | Twilio / SendGrid client with automatic dry-run when not configured |
+| `backend/validation.py` | Report validation, phone normalisation (E.164), rate limiter |
+| `store.py` | SQLite storage shared by the API and the dashboard |
+| `pipeline.py` | Orchestrates ingest, scoring, tiering, LLM enrichment and themes |
+| `ingest.py` | Loads the dataset + stored conversations, normalises emails, infers property per thread |
+| `scoring.py` | Issue type, urgency score (0-100) with reasons, sentiment |
+| `escalation.py` | Human-required rules and risk flags |
+| `autoresolve.py` | FAQ template matching |
+| `llm.py` | LLM client: one JSON call per thread, prompt-injection fencing, caching, circuit breaker |
+| `themes.py` | Portfolio-level clusters |
+| `constants.py` | Shared term sets and word-boundary matching |
+| `ui_compat.py` | Streamlit compatibility shim for embedded HTML |
+| `data/proptech-test-data.json` | Sample dataset (100 emails, 92 threads, 5 properties) |
+| `tests/` | pytest suite (store, API, webhooks with real Twilio signatures, alerts, replies, triage) |
+| `Dockerfile`, `docker-compose.yml`, `.github/workflows/ci.yml` | Containers and CI |
 
 ## Setup
+
+Python 3.10+.
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
+cp .env.example .env   # set HEARTHLINE_PASSWORD at minimum
 ```
 
-## Environment Variables
-```bash
-export LLM_MODEL=mistral-small-3.2-24b-instruct
-export LLM_BASE_URL=http://localhost:1234/v1
-export LLM_API_KEY=local-dev-key
-# optional
-export LLM_TIMEOUT_S=20
-```
-
-Notes:
-- `LLM_MODEL` defaults to `mistral-small-3.2-24b-instruct`.
-- If `LLM_BASE_URL` is missing/unreachable, app falls back to deterministic summary/action/draft/theme text.
+All settings are documented in `.env.example`. Without Twilio or SendGrid credentials the app runs in **dry-run mode**: every SMS, call and email is logged and recorded as `dry_run` instead of being sent, so the whole flow works with no account.
 
 ## Run
+
 ```bash
+./scripts/dev.sh
+```
+
+or in two terminals:
+
+```bash
+uvicorn backend.main:app --port 8000 --env-file .env
 streamlit run app.py
 ```
 
-Default dataset path in app:
-- `data/proptech-test-data.json`
+- Resident portal: http://localhost:8501
+- Manager dashboard: http://localhost:8501/admin
+- API docs: http://localhost:8000/docs
 
-## Tier Logic (Order Matters)
-1. Human-required detection (`escalation.py`)
-2. Auto-resolve FAQ matching (`autoresolve.py`)
-3. Remaining threads are AI draft ready (`llm.py`)
+Reports and messages are stored in `data/hearthline.db` (an older `data/resident_reports.json` is imported automatically on first start). Each conversation has a status (New, In progress, Resolved); resolved ones are hidden unless "Show resolved reports" is on. The portal only accepts known buildings, is rate-limited per IP, and silently drops bot submissions caught by a honeypot field.
 
-## Inbox Sorting
-Threads are sorted by:
-1. `urgency_score` descending
-2. tier priority: `human` > `ai` > `auto`
-3. `latest_timestamp` descending
+### Docker
 
-## Demo Scenarios
-1. Critical maintenance
-- Example: leak/no heating/fire alarm with unread follow-ups.
-- Expected: high urgency; often `human` or `ai` depending on escalation rules.
-
-2. Legal/compliance risk
-- Example: RTB/solicitor/legal action/environmental health language in multi-email thread.
-- Expected: `human` tier with `do not auto-respond`; context summary for manager.
-
-3. Commercial opportunity
-- Example: viewing request or corporate let inquiry.
-- Expected: `prospect` issue type, generally lower urgency than emergencies, typically `ai` tier unless FAQ template match.
-
-## Known Limitations
-- Rule-based NLP only (keyword matching).
-- No database/auth/background workers.
-- LLM calls are best-effort and depend on local endpoint availability.
-- Single-process Streamlit MVP for demo use.
-
-## Quick Sanity Check
 ```bash
-python3 -m py_compile app.py ingest.py escalation.py autoresolve.py scoring.py llm.py themes.py pipeline.py
-python3 - <<'PY'
-from pipeline import run_pipeline
-threads, themes, emails, warnings = run_pipeline('data/proptech-test-data.json', llm_enabled=True)
-print(len(threads), len(themes), len(emails), warnings[:2])
-PY
+docker compose up --build
 ```
+
+Runs the API (port 8000) and the Streamlit app (port 8501) with a shared data volume.
+
+## Twilio setup
+
+1. Expose the API: `ngrok http 8000`, then set `HEARTHLINE_PUBLIC_URL` to the https URL.
+2. In the Twilio console, set your number's (or the WhatsApp sandbox's) "A message comes in" webhook to
+   `POST {HEARTHLINE_PUBLIC_URL}/webhooks/twilio/messaging`.
+3. Fill in `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` (and `TWILIO_WHATSAPP_FROM` for WhatsApp) and `ONCALL_NUMBERS`.
+
+What happens then:
+
+- **Inbound SMS/WhatsApp** become conversations in the dashboard. Follow-ups from the same number join the open conversation. The resident gets a reference number and, for leaks, gas or fire, a safety tip.
+- **Critical issues** text the first on-call number: "Reply ACK 3F9A2C to take it". If nobody acknowledges within `ALERT_ACK_TIMEOUT_MIN`, the next person on the rota gets a phone call ("Press 1 to take this issue").
+- **Approve & Send** in the dashboard replies on the resident's channel: SMS/WhatsApp for text conversations, SMS for portal reports only if the resident ticked the consent box, otherwise email via SendGrid.
+- **STOP / START** are honoured: after STOP no text is ever sent to that number.
+- Every webhook is checked against Twilio's `X-Twilio-Signature`. For local experiments without Twilio you can set `HEARTHLINE_INSECURE_WEBHOOKS=1` and simulate a message:
+
+```bash
+curl -X POST localhost:8000/webhooks/twilio/messaging \
+  -d From=+353871234567 -d Body="Water leaking through my ceiling onto the lights"
+```
+
+## Tests
+
+```bash
+pytest
+python -m pyflakes *.py pages/*.py backend/*.py tests/*.py
+```
+
+GitHub Actions runs both on every push and pull request (Python 3.10 and 3.12), see `.github/workflows/ci.yml`.
+
+## How tiering works (order matters)
+
+1. **Human** (`escalation.py`): tenant thread with 3+ touches; tenant writes again after a contractor or management reply; prior fix described as failed; welfare-check signal; RTB / solicitor / legal action / tribunal language; a legal or regulatory sender raising a dispute, breach, complaint or non-compliance (routine notices such as tax reminders are flagged `regulatory_notice` but stay in the AI tier); media contact.
+2. **Auto** (`autoresolve.py` + `pipeline.py`): only when the thread was started by a tenant, the issue type is general/operational, the tenant's first message matches an FAQ template, the tone is neutral or concerned, and no strong signal (leak, damp, mould, heating, pests, legal...) appears anywhere in the thread.
+3. **AI**: everything else.
+
+Keyword matching is word-boundary aware (`constants.contains_word`), so "rte" does not match "reported" and "bin" does not match "plumbing", while "leak" still matches "leaking".
+
+Urgency combines issue type, safety/legal/repeat signals, vulnerability (baby, elderly, pregnant), sender type, unread inbound mail, attachments and how long the latest inbound message has waited.
+
+## Known limitations
+
+- Rule-based classification: unusual wording can still be misrouted. An LLM intent check for FAQ matching is on the roadmap (`REVIEW_AND_ROADMAP.md`).
+- The sample email dataset is static; live email ingestion (SendGrid Inbound Parse) is not built yet.
+- SQLite and the in-memory rate limiter assume a single API process. Use Postgres and a shared limiter (e.g. Redis) before scaling out.
+- The dashboard has a single shared login; per-user accounts and Twilio Verify OTP are on the roadmap.

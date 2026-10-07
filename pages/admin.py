@@ -1,21 +1,29 @@
 from __future__ import annotations
 
+import hmac
+import html
+import json
 import os
+import time
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
-from pipeline import run_pipeline
+from ui_compat import embed_html
+
+import store
+from backend.replies import ReplyError, reply_route, send_reply
+from pipeline import DEFAULT_DATASET_PATH, run_pipeline
+
+_REPORT_STATUS_LABELS = {"new": "New", "in_progress": "In progress", "resolved": "Resolved"}
 
 load_dotenv()
 
-DEFAULT_DATASET_PATH = "data/proptech-test-data.json"
 
 st.set_page_config(
-    page_title="Lette · Admin Dashboard",
+    page_title="Hearthline · Admin Dashboard",
     page_icon="📬",
     layout="wide",
 )
@@ -78,7 +86,7 @@ h1 { font-size: 1.6rem !important; font-weight: 700 !important; letter-spacing: 
 h2 { font-weight: 600 !important; letter-spacing: -0.015em !important; }
 
 /* ── Section labels ── */
-.lette-label {
+.hearthline-label {
     display: block; font-size: 10px; font-weight: 700;
     letter-spacing: 0.16em; text-transform: uppercase;
     color: #4A4A3F; margin-bottom: 12px;
@@ -189,8 +197,13 @@ hr { border-color:#D2D0CF; }
 #  HTML helpers
 # ─────────────────────────────────────────────
 
+def _e(value) -> str:
+    """HTML-escape any dynamic value before it goes into unsafe_allow_html markup."""
+    return html.escape(str(value if value is not None else ""), quote=True)
+
+
 def _label(text: str) -> str:
-    return f'<div class="lette-label">{text}</div>'
+    return f'<div class="hearthline-label">{text}</div>'
 
 def _tier_badge(tier: str) -> str:
     cfg = {
@@ -217,10 +230,53 @@ def _fmt_list(values: list | None) -> str:
 #  Auth
 # ─────────────────────────────────────────────
 
+_MAX_FAILED_ATTEMPTS = 5
+_LOCKOUT_SECONDS = 300
+
+
+def _configured_credentials() -> tuple[str, str] | None:
+    """Credentials must come from the environment; there are no built-in defaults."""
+    user = os.getenv("HEARTHLINE_USERNAME", "").strip()
+    password = os.getenv("HEARTHLINE_PASSWORD", "")
+    if not user or not password:
+        return None
+    return user, password
+
+
+@st.cache_resource
+def _failed_logins() -> dict:
+    """Process-wide failed-attempt tracker (shared across browser sessions)."""
+    return {}
+
+
+def _lockout_remaining(username: str) -> int:
+    entry = _failed_logins().get(username.strip().lower())
+    if not entry or entry["count"] < _MAX_FAILED_ATTEMPTS:
+        return 0
+    remaining = int(entry["locked_at"] + _LOCKOUT_SECONDS - time.time())
+    if remaining <= 0:
+        _failed_logins().pop(username.strip().lower(), None)
+        return 0
+    return remaining
+
+
+def _record_failure(username: str) -> None:
+    key = username.strip().lower()
+    entry = _failed_logins().setdefault(key, {"count": 0, "locked_at": 0.0})
+    entry["count"] += 1
+    if entry["count"] >= _MAX_FAILED_ATTEMPTS:
+        entry["locked_at"] = time.time()
+
+
 def _check_credentials(username: str, password: str) -> bool:
-    expected_user = os.getenv("LETTE_USERNAME", "admin").strip()
-    expected_pass = os.getenv("LETTE_PASSWORD", "lette").strip()
-    return username.strip() == expected_user and password == expected_pass
+    configured = _configured_credentials()
+    if configured is None:
+        return False
+    expected_user, expected_pass = configured
+    # Constant-time comparison; evaluate both so timing doesn't reveal which one failed.
+    user_ok = hmac.compare_digest(username.strip().encode(), expected_user.encode())
+    pass_ok = hmac.compare_digest(password.encode(), expected_pass.encode())
+    return user_ok and pass_ok
 
 
 _LOGIN_CSS = """
@@ -313,33 +369,57 @@ def _render_login() -> None:
         st.markdown("<div style='height:18vh'></div>", unsafe_allow_html=True)
         # Branding — plain markdown, no wrapping div
         st.markdown(
-            '<div style="font-size:22px;font-weight:700;letter-spacing:-0.03em;color:#0F1016;margin-bottom:2px">Lette</div>'
+            '<div style="font-size:22px;font-weight:700;letter-spacing:-0.03em;color:#0F1016;margin-bottom:2px">Hearthline</div>'
             '<div style="font-size:10px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;'
             'color:#4A4A3F;margin-bottom:28px">Admin · Sign in</div>',
             unsafe_allow_html=True,
         )
-        username = st.text_input("Email", placeholder="you@lette.ai", key="login_username")
+        if _configured_credentials() is None:
+            st.markdown(
+                '<div style="background:#FAE0DE;border:1px solid #D9A8A3;border-radius:6px;'
+                'padding:10px 14px;font-size:13px;color:#7A1208">'
+                'Admin sign-in is disabled. Set HEARTHLINE_USERNAME and HEARTHLINE_PASSWORD in your .env file.</div>',
+                unsafe_allow_html=True,
+            )
+            return
+
+        username = st.text_input("Username", placeholder="admin", key="login_username")
         password = st.text_input("Password", type="password", placeholder="••••••••", key="login_password")
         if st.button("Sign in", key="login_submit", use_container_width=True):
-            if _check_credentials(username, password):
+            error = ""
+            locked_for = _lockout_remaining(username)
+            if locked_for:
+                error = f"Too many failed attempts. Try again in {locked_for // 60 + 1} min."
+            elif _check_credentials(username, password):
+                _failed_logins().pop(username.strip().lower(), None)
                 st.session_state.authenticated = True
-                st.session_state.auth_user = username
+                st.session_state.auth_user = username.strip()
                 st.rerun()
             else:
-                st.markdown(
-                    '<div style="background:#FAE0DE;border:1px solid #D9A8A3;border-radius:6px;'
-                    'padding:10px 14px;font-size:13px;color:#7A1208;margin-top:12px">'
-                    'Incorrect email or password.</div>',
-                    unsafe_allow_html=True,
-                )
+                _record_failure(username)
+                error = "Incorrect username or password."
+            st.markdown(
+                '<div style="background:#FAE0DE;border:1px solid #D9A8A3;border-radius:6px;'
+                f'padding:10px 14px;font-size:13px;color:#7A1208;margin-top:12px">{_e(error)}</div>',
+                unsafe_allow_html=True,
+            )
 
 
 # ─────────────────────────────────────────────
 #  Pipeline cache
 # ─────────────────────────────────────────────
 
+def _mtime(path: str) -> float:
+    try:
+        return Path(path).stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 @st.cache_data(show_spinner=False)
-def cached_run(dataset_path: str, llm_enabled: bool) -> tuple:
+def cached_run(dataset_path: str, llm_enabled: bool, data_version: tuple) -> tuple:
+    # data_version (file mtimes, no leading underscore so Streamlit hashes it) is part of the cache key, so a new portal report
+    # or an edited dataset re-runs the pipeline; otherwise results stay cached.
     return run_pipeline(dataset_path=dataset_path, llm_enabled=llm_enabled)
 
 # ─────────────────────────────────────────────
@@ -399,10 +479,11 @@ def _render_metrics(thread_df: pd.DataFrame) -> None:
         )
         if col.button(" ", key=f"qf_{fkey or 'all'}", use_container_width=True):
             st.session_state.quick_filter = None if is_active else fkey
+            st.session_state.inbox_page = 0
             st.rerun()
 
     # Stamp the 6-column metric HB so the CSS above applies only there
-    components.html("""
+    embed_html("""
 <script>
 (function stamp() {
   var hbs = parent.document.querySelectorAll('[data-testid="stHorizontalBlock"]');
@@ -429,10 +510,10 @@ def _render_themes(themes_df: pd.DataFrame) -> None:
             props = ", ".join(row.get("affected_properties",[]))
             col.markdown(f"""
 <div class="theme-card">
-  <div class="theme-card-eyebrow">{sev} · {count} THREADS</div>
-  <div class="theme-card-title">{row.get("theme_label","Theme")}</div>
-  <div class="theme-card-insight">{props}<br><br>{row.get("insight","")}</div>
-  <div class="theme-card-action">→ {row.get("portfolio_action","")}</div>
+  <div class="theme-card-eyebrow">{_e(sev)} · {_e(count)} THREADS</div>
+  <div class="theme-card-title">{_e(row.get("theme_label","Theme"))}</div>
+  <div class="theme-card-insight">{_e(props)}<br><br>{_e(row.get("insight",""))}</div>
+  <div class="theme-card-action">→ {_e(row.get("portfolio_action",""))}</div>
 </div>""", unsafe_allow_html=True)
 
 
@@ -465,8 +546,34 @@ def _apply_filters(thread_df: pd.DataFrame, filters: dict) -> pd.DataFrame:
     return out
 
 
-def _render_inbox(thread_df: pd.DataFrame, selected_id: str | None) -> str | None:
-    st.markdown(_label(f"Inbox — {len(thread_df)} Thread{'s' if len(thread_df)!=1 else ''}"), unsafe_allow_html=True)
+INBOX_PAGE_SIZE = 20
+
+
+def _render_pager(total: int) -> tuple[int, int]:
+    """Prev/next controls. Returns the (start, end) slice for the current page."""
+    pages = max(1, (total + INBOX_PAGE_SIZE - 1) // INBOX_PAGE_SIZE)
+    page = min(max(int(st.session_state.get("inbox_page", 0)), 0), pages - 1)
+    st.session_state.inbox_page = page
+    if pages > 1:
+        prev_col, info_col, next_col = st.columns([2, 3, 2])
+        if prev_col.button("← Prev", key="page_prev", disabled=page == 0, use_container_width=True):
+            st.session_state.inbox_page = page - 1
+            st.rerun()
+        info_col.markdown(
+            f'<div style="text-align:center;font-size:12px;color:#4A4A3F;padding-top:8px">'
+            f'Page {page + 1} of {pages}</div>',
+            unsafe_allow_html=True,
+        )
+        if next_col.button("Next →", key="page_next", disabled=page >= pages - 1, use_container_width=True):
+            st.session_state.inbox_page = page + 1
+            st.rerun()
+    start = page * INBOX_PAGE_SIZE
+    return start, min(start + INBOX_PAGE_SIZE, total)
+
+
+def _render_inbox(thread_df: pd.DataFrame, selected_id: str | None, total: int | None = None) -> str | None:
+    total = len(thread_df) if total is None else total
+    st.markdown(_label(f"Inbox — {total} Thread{'s' if total!=1 else ''}"), unsafe_allow_html=True)
     clicked = None
     for _, row in thread_df.iterrows():
         tid      = str(row.get("thread_id",""))
@@ -475,14 +582,17 @@ def _render_inbox(thread_df: pd.DataFrame, selected_id: str | None) -> str | Non
         score    = int(row.get("urgency_score",0))
         unread   = int(row.get("unread_count",0))
         emails   = int(row.get("email_count",0))
-        issue    = str(row.get("issue_type","")).replace("_"," ")
-        prop     = str(row.get("property_name","—"))
-        subj     = str(row.get("subject","(no subject)"))
+        issue = _e(str(row.get("issue_type","")).replace("_"," "))
+        prop = _e(str(row.get("property_name","—")))
+        subj = _e(str(row.get("subject","(no subject)")))
         sentiment    = str(row.get("sentiment","neutral"))
         is_selected  = (tid == selected_id)
         selected_cls = " thread-card-selected" if is_selected else ""
         unread_chip  = f'<span class="chip chip-unread">{unread} unread</span>' if unread > 0 else ""
         sent_chip    = _sentiment_chip(sentiment) if sentiment != "neutral" else ""
+        report_status = row.get("report_status")
+        if isinstance(report_status, str) and report_status:
+            sent_chip += f'<span class="chip">{_e(_REPORT_STATUS_LABELS.get(report_status, report_status))}</span>'
         btn_label    = "● Open" if is_selected else "Open →"
         st.markdown(f"""
 <div class="thread-card{selected_cls}">
@@ -528,6 +638,90 @@ def _render_timeline(thread_id: str, emails_df: pd.DataFrame) -> None:
                 st.markdown(str(row.get("body","") or "*(empty body)*"))
 
 
+def _actor() -> str:
+    return str(st.session_state.get("auth_user") or "manager")
+
+
+def _render_report_status(thread_id: str, status: str) -> None:
+    """Status controls for resident conversations (thread ids look like conv_<uuid>)."""
+    report_id = store.conversation_id_from_thread(thread_id) or thread_id
+    st.markdown(_label(f"Report status · {_REPORT_STATUS_LABELS.get(status, status)}"), unsafe_allow_html=True)
+    actions = [("in_progress", "Mark in progress"), ("resolved", "Mark resolved"), ("new", "Reopen")]
+    cols = st.columns(len(actions))
+    for col, (target, label) in zip(cols, actions):
+        if col.button(label, key=f"status_{target}_{report_id}", disabled=(status == target),
+                      use_container_width=True):
+            try:
+                ok = store.update_conversation_status(report_id, target, actor=_actor())
+            except (OSError, ValueError) as exc:
+                st.error(f"Could not update status: {exc}")
+                return
+            if ok:
+                st.rerun()
+            st.error("Report not found; it may have been removed.")
+
+
+_CHANNEL_NAMES = {"sms": "SMS", "whatsapp": "WhatsApp", "email": "email"}
+
+
+def _latest_inbound_email(thread_id: str, emails_df: pd.DataFrame) -> str | None:
+    rows = emails_df[(emails_df["thread_id"] == thread_id)
+                     & emails_df["from_type"].isin(["tenant", "prospect", "landlord", "external"])]
+    addresses = [a for a in rows["from_email"].tolist() if a and "@" in str(a)]
+    return addresses[-1] if addresses else None
+
+
+def _render_send(selected: pd.Series, body: str, emails_df: pd.DataFrame) -> None:
+    """Approve & Send on the resident's channel (dry-run unless Twilio/SendGrid are configured)."""
+    thread_id = str(selected.get("thread_id", ""))
+    flash_key = f"send_result_{thread_id}"
+    if flash_key in st.session_state:
+        kind, text = st.session_state.pop(flash_key)
+        (st.success if kind == "ok" else st.error)(text)
+    try:
+        channel, to = reply_route(thread_id, _latest_inbound_email(thread_id, emails_df))
+    except ReplyError as exc:
+        st.caption(f"Approve & send unavailable: {exc}")
+        return
+    # Button labels are Markdown: escape "+" so the phone number keeps its country prefix.
+    shown_to = to.removeprefix("whatsapp:").replace("+", "\\+")
+    label = f"Approve & send via {_CHANNEL_NAMES.get(channel, channel)} to {shown_to}"
+    if st.button(label, key=f"send_{thread_id}", type="primary", use_container_width=True):
+        try:
+            result = send_reply(thread_id, body, _actor(), subject=str(selected.get("subject", "")),
+                                fallback_email=_latest_inbound_email(thread_id, emails_df))
+        except ReplyError as exc:
+            st.session_state[flash_key] = ("error", str(exc))
+        else:
+            if result.ok:
+                note = " (dry run: Twilio/SendGrid not configured, nothing was actually sent)" if result.dry_run else ""
+                st.session_state[flash_key] = ("ok", f"Sent via {_CHANNEL_NAMES.get(result.channel, result.channel)}{note}.")
+                conversation_id = store.conversation_id_from_thread(thread_id)
+                if conversation_id and selected.get("report_status") == "new":
+                    store.update_conversation_status(conversation_id, "in_progress", actor=_actor())
+            else:
+                st.session_state[flash_key] = ("error", f"Send failed: {result.error}")
+        st.rerun()
+
+
+def _render_alerts(thread_id: str) -> None:
+    alerts = store.alerts_for_thread(thread_id)
+    if not alerts:
+        return
+    st.markdown(_label("On-call alerts"), unsafe_allow_html=True)
+    acked = any(a["acked_at"] for a in alerts)
+    for a in alerts:
+        state = f"acknowledged by {a['acked_by']} at {a['acked_at']}" if a["acked_at"] else a["status"]
+        st.markdown(
+            f'<div style="font-size:12px;color:#4A4A3F">{_e(a["created_at"])} · {_e(a["channel"].upper())} to '
+            f'{_e(a["recipient"])} · code {_e(a["ack_code"])} · {_e(state)}</div>',
+            unsafe_allow_html=True,
+        )
+    if not acked and st.button("Acknowledge alert (I'm handling this)", key=f"ack_{thread_id}"):
+        store.acknowledge_alerts(thread_id, _actor())
+        st.rerun()
+
+
 def _render_thread_detail(selected: pd.Series, emails_df: pd.DataFrame) -> None:
     st.markdown(_label("Thread Detail"), unsafe_allow_html=True)
     tier    = str(selected.get("tier","ai"))
@@ -538,24 +732,28 @@ def _render_thread_detail(selected: pd.Series, emails_df: pd.DataFrame) -> None:
     with left:
         st.markdown(
             f'{_tier_badge(tier)}&nbsp;&nbsp;{_urgency_chip(urgency,score)}'
-            f'<div style="font-size:12px;color:#4A4A3F;margin-top:8px">{selected.get("handling_reason","")}</div>',
+            f'<div style="font-size:12px;color:#4A4A3F;margin-top:8px">{_e(selected.get("handling_reason",""))}</div>',
             unsafe_allow_html=True,
         )
     with right:
         risk_flags = selected.get("risk_flags") or []
         if isinstance(risk_flags, list) and risk_flags:
-            st.markdown("".join(f'<span class="risk-flag">{f}</span>' for f in risk_flags), unsafe_allow_html=True)
+            st.markdown("".join(f'<span class="risk-flag">{_e(f)}</span>' for f in risk_flags), unsafe_allow_html=True)
+
+    report_status = selected.get("report_status")
+    if isinstance(report_status, str) and report_status:
+        _render_report_status(str(selected.get("thread_id", "")), report_status)
 
     st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
     reasoning = str(selected.get("reasoning","") or "")
     if reasoning:
         with st.expander("Scoring reasoning"):
-            st.markdown(f'<div style="font-size:12px;color:#4A4A3F;line-height:1.6">{reasoning}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div style="font-size:12px;color:#4A4A3F;line-height:1.6">{_e(reasoning)}</div>', unsafe_allow_html=True)
 
     summary = str(selected.get("summary","") or "")
     if summary:
         st.markdown(_label("Summary"), unsafe_allow_html=True)
-        st.markdown(f'<div class="detail-block">{summary}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="detail-block">{_e(summary)}</div>', unsafe_allow_html=True)
 
     action = str(selected.get("recommended_action","") or "")
     if action:
@@ -563,10 +761,10 @@ def _render_thread_detail(selected: pd.Series, emails_df: pd.DataFrame) -> None:
         owner_html = (
             f'<span style="font-size:10px;font-weight:700;letter-spacing:0.1em;'
             f'text-transform:uppercase;color:#4E5449;margin-bottom:6px;display:block">'
-            f'Owner: {action_owner}</span>'
+            f'Owner: {_e(action_owner)}</span>'
         ) if action_owner else ""
         st.markdown(_label("Recommended Action"), unsafe_allow_html=True)
-        st.markdown(f'<div class="detail-block-action">{owner_html}{action}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="detail-block-action">{owner_html}{_e(action)}</div>', unsafe_allow_html=True)
 
     st.markdown(_label("Draft Reply"), unsafe_allow_html=True)
     if tier == "human":
@@ -585,16 +783,17 @@ def _render_thread_detail(selected: pd.Series, emails_df: pd.DataFrame) -> None:
                 key=edit_key,
                 label_visibility="collapsed",
             )
-            copy_col, reset_col, _ = st.columns([2, 2, 5])
+            copy_col, reset_col, _ = st.columns([3, 2, 4])
             with copy_col:
-                components.html(
-                    f"""<button onclick="navigator.clipboard.writeText({repr(edited)}).then(()=>{{
+                embed_html(
+                    f"""<button onclick="navigator.clipboard.writeText({html.escape(json.dumps(edited), quote=True)}).then(()=>{{
                         this.textContent='Copied ✓';
                         setTimeout(()=>this.textContent='Copy draft',1500);
                     }})" style="
                         width:100%;background:#0F1016;color:#EDEDE9;border:none;
                         border-radius:5px;padding:7px 14px;font-size:12px;font-weight:600;
-                        letter-spacing:0.04em;cursor:pointer;font-family:inherit;">
+                        letter-spacing:0.04em;cursor:pointer;white-space:nowrap;
+                        font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
                         Copy draft
                     </button>""",
                     height=38,
@@ -603,16 +802,37 @@ def _render_thread_detail(selected: pd.Series, emails_df: pd.DataFrame) -> None:
                 if st.button("Reset ↺", key=f"reset_{thread_id}", use_container_width=True):
                     st.session_state[edit_key] = draft
                     st.rerun()
+            _render_send(selected, edited, emails_df)
         else:
             st.markdown('<div style="font-size:13px;color:#4A4A3F">No draft reply generated.</div>', unsafe_allow_html=True)
 
+    _render_alerts(str(selected.get("thread_id", "")))
+
     st.markdown(_label("Message Timeline"), unsafe_allow_html=True)
     _render_timeline(str(selected.get("thread_id","")), emails_df)
+
+    entries = store.audit_entries(str(selected.get("thread_id", "")))
+    if entries:
+        with st.expander(f"Activity log ({len(entries)})"):
+            for entry in entries:
+                detail = ", ".join(f"{k}={v}" for k, v in entry["detail"].items() if v)
+                st.markdown(
+                    f'<div style="font-size:12px;color:#4A4A3F">{_e(entry["at"])} · <b>{_e(entry["actor"])}</b> · '
+                    f'{_e(entry["action"])}{" · " + _e(detail) if detail else ""}</div>',
+                    unsafe_allow_html=True,
+                )
 
 
 # ─────────────────────────────────────────────
 #  Main
 # ─────────────────────────────────────────────
+
+@st.cache_resource
+def _migrate_legacy_reports() -> int:
+    return store.migrate_legacy_reports()
+
+
+_migrate_legacy_reports()
 
 # Auth gate
 if not st.session_state.get("authenticated", False):
@@ -644,7 +864,7 @@ title_col, signout_col = st.columns([9, 1])
 with title_col:
     st.markdown(
         '<div style="margin-bottom:10px">'
-        '<div style="font-size:10px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;color:#4A4A3F;margin-bottom:4px">Lette</div>'
+        '<div style="font-size:10px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;color:#4A4A3F;margin-bottom:4px">Hearthline</div>'
         '<h1 style="margin:0;padding:0">Inbox Triage</h1>'
         '</div>',
         unsafe_allow_html=True,
@@ -664,7 +884,11 @@ if not Path(dataset_path).exists():
 
 try:
     with st.spinner("Analysing inbox…"):
-        thread_df, themes_df, emails_df, warnings = cached_run(dataset_path, llm_enabled)
+        thread_df, themes_df, emails_df, warnings = cached_run(
+            dataset_path,
+            llm_enabled,
+            (_mtime(dataset_path), store.data_version()),
+        )
 except Exception as exc:  # noqa: BLE001
     st.error(f"Pipeline error: {type(exc).__name__}: {exc}"); st.stop()
 
@@ -683,6 +907,9 @@ st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 
 filters  = _render_filters(thread_df)
 filtered = _apply_filters(thread_df, filters)
+show_resolved = st.toggle("Show resolved reports", value=False, key="show_resolved")
+if not show_resolved:
+    filtered = filtered[filtered["report_status"].fillna("") != "resolved"]
 
 if filtered.empty:
     st.info("No threads match the current filters."); st.stop()
@@ -693,7 +920,7 @@ if "selected_thread_id" not in st.session_state or st.session_state.selected_thr
 
 # Scroll to top after a thread is selected
 if st.session_state.pop("_scroll_to_top", False):
-    components.html(
+    embed_html(
         """<script>
         (function () {
             var p = window.parent;
@@ -714,7 +941,8 @@ if st.session_state.pop("_scroll_to_top", False):
 st.markdown('<div id="thread-section"></div>', unsafe_allow_html=True)
 inbox_col, detail_col = st.columns([5,4], gap="large")
 with inbox_col:
-    clicked = _render_inbox(filtered, st.session_state.selected_thread_id)
+    start, end = _render_pager(len(filtered))
+    clicked = _render_inbox(filtered.iloc[start:end], st.session_state.selected_thread_id, total=len(filtered))
     if clicked is not None:
         st.session_state.selected_thread_id = clicked
         st.session_state["_scroll_to_top"] = True

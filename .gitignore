@@ -18,7 +18,7 @@ dist/
 
 # Local env/config
 .env
-.streamlit/
+.streamlit/secrets.toml
 
 # Editor/OS
 .vscode/
@@ -26,5 +26,11 @@ dist/
 .DS_Store
 *.swp
 
-# Optional local dataset (can be re-added if needed)
-data/proptech-test-data.json
+# Local data (contains residents' personal data)
+data/hearthline.db*
+data/resident_reports*.json
+
+# Scratch
+_to_delete/
+data/*.tmp
+data/resident_reports.corrupt-*.json

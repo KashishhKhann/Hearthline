@@ -4,20 +4,23 @@ import re
 
 import pandas as pd
 
-from constants import contains_any, is_welfare_signal, thread_text
+from constants import contains_word, is_welfare_signal, thread_text
 
 
 # ── New risk-flag term sets ────────────────────────────────────────────────────
 
 MEDIA_RISK_TERMS = {
     "rte",
+    "rté",
     "journalist",
     "reporter",
     "press enquiry",
     "media enquiry",
     "newspaper",
     "broadcast",
-    "social media",
+    "post on social media",
+    "posting on social media",
+    "share on social media",
     "going to the press",
     "going to media",
     "twitter",
@@ -28,6 +31,7 @@ VULNERABLE_TERMS = {
     "baby",
     "infant",
     "elderly",
+    "pregnant",
     "disabled",
     "disability",
     "wheelchair",
@@ -55,9 +59,10 @@ def _has_deadline_imminent(text: str) -> bool:
 def _scan_extra_risk_flags(full_text: str) -> list[str]:
     """Scan for risk flags that don't necessarily trigger human escalation tier."""
     flags: list[str] = []
-    if contains_any(full_text, MEDIA_RISK_TERMS):
+    # Word-boundary matching: "rte" must not match "citynorth", "reported", "started".
+    if contains_word(full_text, MEDIA_RISK_TERMS):
         flags.append("media_risk")
-    if contains_any(full_text, VULNERABLE_TERMS):
+    if contains_word(full_text, VULNERABLE_TERMS):
         flags.append("vulnerable_tenant")
     if _has_deadline_imminent(full_text):
         flags.append("deadline_imminent")
@@ -94,18 +99,56 @@ PRIOR_FAILURE_TERMS = {
     "no actual fix",
 }
 
+# Formal legal/regulatory signals: always a human, even in a single-email thread.
+LEGAL_HARD_TERMS = {
+    "rtb",
+    "solicitor",
+    "legal action",
+    "tribunal",
+    "dispute resolution",
+}
+
+# A message from a legal/regulatory sender only needs a human when it is adversarial
+# or enforcement-related. Routine notices (tax reminders, scheduled inspections,
+# planning notifications) stay in the AI tier.
+LEGAL_ACTION_TERMS = {
+    "dispute",
+    "breach",
+    "complaint",
+    "warning notice",
+    "termination",
+    "notice of termination",
+    "enforcement notice",
+    "enforcement action",
+    "improvement notice",
+    "prohibition notice",
+    "non-compliant",
+    "non-compliance",
+    "proceedings",
+    "legal action",
+    "solicitor",
+    "tribunal",
+    "rtb",
+    "my client",
+    "i act for",
+    "residential tenancies act",
+    "obligated",
+    "compensation",
+    "damages",
+}
+
 MANAGEMENT_SENDER_TYPES = {"internal", "landlord"}
 CONTRACTOR_SENDER_TYPES = {"contractor", "vendor"}
 
 
 def _contains_escalation_language(thread_df: pd.DataFrame) -> bool:
     full_text = thread_text(thread_df)
-    return contains_any(full_text, ESCALATION_TERMS)
+    return contains_word(full_text, ESCALATION_TERMS)
 
 
 def _mentions_prior_intervention_unresolved(text: str) -> bool:
-    intervention = contains_any(text, PRIOR_INTERVENTION_TERMS)
-    unresolved = contains_any(text, PRIOR_FAILURE_TERMS)
+    intervention = contains_word(text, PRIOR_INTERVENTION_TERMS)
+    unresolved = contains_word(text, PRIOR_FAILURE_TERMS)
     return intervention and unresolved
 
 
@@ -144,14 +187,13 @@ def detect_human_required(thread_df: pd.DataFrame) -> dict:
     )
 
     first_sender = str(ordered.iloc[0].get("from_type", "unknown") or "unknown").lower()
-    latest_position = int(ordered.iloc[-1].get("thread_position", 1) or 1)
     full_text = thread_text(ordered)
 
     triggered_rule = ""
     reason = ""
     risk_flags: list[str] = []
 
-    if len(ordered) >= 3 and latest_position >= 3 and first_sender == "tenant":
+    if len(ordered) >= 3 and first_sender == "tenant":
         triggered_rule = "tenant_multi_touch"
         reason = "Thread reached 3+ touches and originated from tenant."
         risk_flags.append("repeat_unresolved")
@@ -177,6 +219,17 @@ def detect_human_required(thread_df: pd.DataFrame) -> dict:
         reason = "Potential welfare-check signal detected from resident report."
         risk_flags.append("welfare_check")
         risk_flags.append("health_safety")
+
+    has_legal_sender = "legal" in {str(t).strip().lower() for t in ordered["from_type"].tolist()}
+    if not triggered_rule and (
+        contains_word(full_text, LEGAL_HARD_TERMS)
+        or (has_legal_sender and contains_word(full_text, LEGAL_ACTION_TERMS))
+    ):
+        triggered_rule = "legal_or_regulatory"
+        reason = "Formal legal/RTB language, or a legal/regulatory sender raising a dispute or enforcement issue."
+        risk_flags.append("legal_risk")
+    elif has_legal_sender:
+        risk_flags.append("regulatory_notice")
 
     if not triggered_rule and len(ordered) > 1 and _contains_escalation_language(ordered):
         triggered_rule = "escalation_language"

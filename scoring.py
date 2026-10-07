@@ -27,10 +27,31 @@ EMERGENCY_TERMS = {
     "mold",
     "damp",
     "health and safety",
-    "baby",
-    "elderly",
     "welfare check",
+    # water ingress described without the word "leak"
+    "flood",
+    "flooded",
+    "burst pipe",
+    "water coming through",
+    "water pouring",
+    "water dripping",
+    "water is dripping",
+    "water is pouring",
+    "water through the ceiling",
+    # gas / electrical / fire
+    "gas leak",
+    "smell of gas",
+    "smell gas",
+    "gas smell",
+    "carbon monoxide",
+    "sparking",
+    "exposed wires",
+    "no electricity",
+    "no power",
+    "smoke coming",
 }
+# Note: "baby"/"elderly" are vulnerability modifiers (+10 below), not emergencies on their
+# own; a mention of a baby should not reclassify a routine thread as emergency maintenance.
 
 # Word-boundary sensitive: "legal" must not match "paralegal", "rent" not "parent", etc.
 LEGAL_TERMS_WB = {
@@ -163,7 +184,7 @@ def classify_issue(text: str) -> str:
         return "emergency_maintenance"
     if contains_word(content, LEGAL_TERMS_WB):
         return "legal"
-    if contains_any(content, EMERGENCY_TERMS):
+    if contains_word(content, EMERGENCY_TERMS):
         return "emergency_maintenance"
     if contains_word(content, FINANCIAL_TERMS_WB) or contains_any(content, FINANCIAL_TERMS):
         return "financial"
@@ -190,12 +211,14 @@ def score_urgency(
     unread: int,
     attachment_count: int,
     issue_type: str | None = None,
+    waiting_hours: float | None = None,
 ) -> tuple[int, list[str]]:
     """Score urgency for a thread.
 
     Args:
         issue_type: Pre-computed issue type. If None, it is derived from text
                     (avoids double-calling classify_issue when the caller already has it).
+        waiting_hours: How long the latest inbound message has gone unanswered.
     """
     text = f"{subject or ''}\n{body or ''}".lower()
 
@@ -209,7 +232,7 @@ def score_urgency(
         score = max(score, 90)
         reasons.append("potential welfare-check concern detected (forced critical floor)")
 
-    if contains_any(text, EMERGENCY_TERMS):
+    if contains_word(text, EMERGENCY_TERMS):
         score += 24
         reasons.append("strong maintenance safety signal (+24)")
 
@@ -229,7 +252,7 @@ def score_urgency(
         score += 10
         reasons.append("hard reporting deadline (+10)")
 
-    if contains_word(text, {"baby", "elderly"}) or "health and safety" in text:
+    if contains_word(text, {"baby", "elderly", "pregnant", "infant"}) or "health and safety" in text:
         score += 10
         reasons.append("vulnerable resident / health risk (+10)")
 
@@ -263,6 +286,12 @@ def score_urgency(
     if attachment_points:
         score += attachment_points
         reasons.append(f"attachments={attachment_count} (+{attachment_points})")
+
+    if waiting_hours is not None and waiting_hours >= 24:
+        days = int(waiting_hours // 24)
+        waiting_points = min(days * 4, 12)
+        score += waiting_points
+        reasons.append(f"awaiting reply for {days} day(s) (+{waiting_points})")
 
     score = max(0, min(100, int(round(score))))
     return score, reasons
@@ -308,12 +337,13 @@ def score_sentiment(text: str) -> str:
     Evaluated in priority order (urgent > angry > frustrated > concerned).
     """
     t = (text or "").lower()
-    if contains_any(t, _SENTIMENT_URGENT):
+    # Word boundaries: "help" must not match "helpful", "demand" not "demanding".
+    if contains_word(t, _SENTIMENT_URGENT):
         return "urgent"
-    if contains_any(t, _SENTIMENT_ANGRY):
+    if contains_word(t, _SENTIMENT_ANGRY):
         return "angry"
-    if contains_any(t, _SENTIMENT_FRUSTRATED):
+    if contains_word(t, _SENTIMENT_FRUSTRATED):
         return "frustrated"
-    if contains_any(t, _SENTIMENT_CONCERNED):
+    if contains_word(t, _SENTIMENT_CONCERNED):
         return "concerned"
     return "neutral"

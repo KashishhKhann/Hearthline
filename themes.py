@@ -128,11 +128,11 @@ def build_themes(
 
     out_df = pd.DataFrame(theme_rows)
 
-    # Sort by thread_count descending, then severity (critical first) using rank map.
+    # Sort by severity first (critical on top), then by cluster size.
     out_df["_severity_rank"] = out_df["severity"].map(_SEVERITY_RANK).fillna(9)
     out_df = out_df.sort_values(
-        by=["thread_count", "_severity_rank"],
-        ascending=[False, True],
+        by=["_severity_rank", "thread_count"],
+        ascending=[True, False],
     ).drop(columns=["_severity_rank"]).reset_index(drop=True)
 
     return out_df

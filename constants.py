@@ -43,20 +43,35 @@ def contains_any(text: str, terms: set[str]) -> bool:
     return any(term in text for term in terms)
 
 
+def _word_pattern(term: str) -> re.Pattern:
+    # Allow common inflections so "leak" still matches "leaks/leaked/leaking" and
+    # "contractor" matches "contractors". Short terms (<=3 chars, e.g. "bin", "rat",
+    # "rte") only allow a plural "s", so "rat" never matches "rated" or "rating".
+    suffix = r"(?:s|es|ed|ing)?" if len(term) > 3 else r"s?"
+    return re.compile(r"\b" + re.escape(term) + suffix + r"\b")
+
+
+_PATTERN_CACHE: dict[str, re.Pattern] = {}
+
+
 def contains_word(text: str, terms: set[str]) -> bool:
     """Word-boundary match for single-word terms to avoid false positives.
 
-    E.g. "rent" won't match "parent"; "legal" won't match "paralegal".
-    Multi-word phrases in the set fall back to substring matching because
-    word boundaries across spaces are already specific enough.
+    E.g. "rent" won't match "parent"; "legal" won't match "paralegal";
+    "rte" won't match "reported". Simple inflections are allowed (see _word_pattern).
+    Multi-word phrases fall back to substring matching because word boundaries
+    across spaces are already specific enough.
     """
     for term in terms:
         if " " in term:
             if term in text:
                 return True
-        else:
-            if re.search(r"\b" + re.escape(term) + r"\b", text):
-                return True
+            continue
+        pattern = _PATTERN_CACHE.get(term)
+        if pattern is None:
+            pattern = _PATTERN_CACHE[term] = _word_pattern(term)
+        if pattern.search(text):
+            return True
     return False
 
 

@@ -1,4 +1,8 @@
-pandas>=2.2.0
-streamlit>=1.35.0
-requests>=2.31.0
-python-dotenv>=1.0.0
+pandas>=2.2,<3
+streamlit>=1.35,<2
+requests>=2.31,<3
+python-dotenv>=1.0,<2
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29,<1
+python-multipart>=0.0.9,<1
+twilio>=9,<10

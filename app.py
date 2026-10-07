@@ -1,95 +1,28 @@
 from __future__ import annotations
 
-import http.server
+import html
 import json
-import threading
-import uuid
-from datetime import datetime
-from pathlib import Path
+import os
 
 import streamlit as st
-import streamlit.components.v1 as components
 from dotenv import load_dotenv
+
+from ui_compat import embed_html
+
+from backend.validation import known_properties
 
 load_dotenv()
 
 st.set_page_config(
-    page_title="Lette · Report an Issue",
+    page_title="Hearthline · Report an Issue",
     page_icon="🏠",
     layout="centered",
 )
 
-# ─────────────────────────────────────────────
-#  Local submission API (daemon thread)
-# ─────────────────────────────────────────────
-
-REPORTS_PATH = Path("data/resident_reports.json")
-_API_PORT    = 8502
-_API_STARTED = False
-
-
-class _ReportHandler(http.server.BaseHTTPRequestHandler):
-    def do_OPTIONS(self) -> None:
-        self.send_response(200)
-        self._cors()
-        self.end_headers()
-
-    def do_POST(self) -> None:
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            data: dict = json.loads(self.rfile.read(length))
-            data["id"]        = str(uuid.uuid4())
-            data["timestamp"] = datetime.utcnow().isoformat() + "Z"
-            data["source"]    = "resident_portal"
-            data["status"]    = "new"
-            _append_report(data)
-            self.send_response(200)
-            self._cors()
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
-        except Exception as exc:  # noqa: BLE001
-            self.send_response(500)
-            self._cors()
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(exc)}).encode())
-
-    def _cors(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-
-    def log_message(self, *_args) -> None:
-        pass
-
-
-def _append_report(report: dict) -> None:
-    REPORTS_PATH.parent.mkdir(exist_ok=True)
-    existing: list = []
-    if REPORTS_PATH.exists():
-        try:
-            existing = json.loads(REPORTS_PATH.read_text())
-            if not isinstance(existing, list):
-                existing = []
-        except Exception:  # noqa: BLE001
-            existing = []
-    existing.append(report)
-    REPORTS_PATH.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
-
-
-def _start_api() -> None:
-    global _API_STARTED
-    if _API_STARTED:
-        return
-    try:
-        server = http.server.HTTPServer(("127.0.0.1", _API_PORT), _ReportHandler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        _API_STARTED = True
-    except OSError:
-        _API_STARTED = True
-
-
-_start_api()
+# Reports are posted straight from the browser to the Hearthline API (FastAPI).
+# HEARTHLINE_API_PUBLIC_URL must be reachable from the resident's browser.
+_API_URL = (os.getenv("HEARTHLINE_API_PUBLIC_URL", "").strip() or "http://127.0.0.1:8000").rstrip("/")
+_SUBMIT_URL = f"{_API_URL}/reports"
 
 # ─────────────────────────────────────────────
 #  Page chrome CSS
@@ -154,7 +87,7 @@ st.markdown(
 
 st.markdown(
     "<div style=\"font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;\">"
-    "<div style=\"font-size:22px;font-weight:700;letter-spacing:-0.03em;color:#0F1016\">Lette</div>"
+    "<div style=\"font-size:22px;font-weight:700;letter-spacing:-0.03em;color:#0F1016\">Hearthline</div>"
     "<div style=\"font-size:10px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;"
     "color:#4A4A3F;margin-top:2px;margin-bottom:28px\">Report an Issue</div>"
     "</div>",
@@ -164,6 +97,16 @@ st.markdown(
 # ─────────────────────────────────────────────
 #  Integrated form + voice component
 # ─────────────────────────────────────────────
+
+_PROPERTIES = known_properties()
+if _PROPERTIES:
+    _PROPERTY_FIELD = (
+        '<select id="f-property"><option value="">Choose your building…</option>'
+        + "".join(f'<option value="{html.escape(p, quote=True)}">{html.escape(p)}</option>' for p in _PROPERTIES)
+        + "</select>"
+    )
+else:
+    _PROPERTY_FIELD = '<input id="f-property" type="text" placeholder="Maple Court">'
 
 FORM_HTML = f"""
 <!DOCTYPE html>
@@ -198,7 +141,13 @@ FORM_HTML = f"""
     margin-bottom: 5px;
   }}
 
-  input, textarea {{
+  .consent-cell {{ display: flex; align-items: flex-end; padding-bottom: 9px; }}
+  label.consent {{
+    display: flex; gap: 8px; align-items: center; text-transform: none;
+    letter-spacing: 0; font-weight: 500; font-size: 13px; color: #0F1016; margin: 0; cursor: pointer;
+  }}
+  label.consent input {{ width: auto; }}
+  input, textarea, select {{
     width: 100%;
     background: #F7F7F5;
     border: 1px solid #D2D0CF;
@@ -210,7 +159,7 @@ FORM_HTML = f"""
     outline: none;
     transition: border-color 0.15s;
   }}
-  input:focus, textarea:focus {{
+  input:focus, textarea:focus, select:focus {{
     border-color: #0F1016;
     box-shadow: 0 0 0 2px rgba(15,16,22,0.07);
   }}
@@ -330,12 +279,22 @@ FORM_HTML = f"""
 
     <div class="row row-2">
       <div>
+        <label>Mobile</label>
+        <input id="f-phone" type="tel" placeholder="087 123 4567" autocomplete="tel">
+      </div>
+      <div class="consent-cell">
+        <label class="consent"><input id="f-consent" type="checkbox"> Text me updates about this report</label>
+      </div>
+    </div>
+
+    <div class="row row-2">
+      <div>
         <label>Flat / Unit *</label>
         <input id="f-unit" type="text" placeholder="Flat 4B">
       </div>
       <div>
         <label>Property *</label>
-        <input id="f-property" type="text" placeholder="Maple Court">
+        {_PROPERTY_FIELD}
       </div>
     </div>
 
@@ -349,6 +308,12 @@ FORM_HTML = f"""
       </div>
       <div class="mic-status" id="micStatus"></div>
       <textarea id="f-issue" placeholder="Type here, or click Speak to dictate…"></textarea>
+    </div>
+
+    <!-- Honeypot: hidden from people, often filled in by spam bots -->
+    <div style="position:absolute;left:-10000px;top:auto;width:1px;height:1px;overflow:hidden" aria-hidden="true">
+      <label for="f-website">Leave this empty</label>
+      <input id="f-website" type="text" tabindex="-1" autocomplete="off">
     </div>
 
     <div class="error-box" id="errorBox"></div>
@@ -365,7 +330,7 @@ FORM_HTML = f"""
   <div class="success-title">Report received, <span id="successName"></span></div>
   <div class="success-body">
     Your issue has been logged and will be reviewed by your property manager shortly.<br>
-    You'll hear back via email if you provided one.
+    Reference: <strong id="successRef"></strong>
   </div>
   <button class="submit-another" onclick="resetForm()">Submit another report</button>
 </div>
@@ -429,6 +394,8 @@ FORM_HTML = f"""
   async function submitForm() {{
     const name     = document.getElementById('f-name').value.trim();
     const email    = document.getElementById('f-email').value.trim();
+    const phone    = document.getElementById('f-phone').value.trim();
+    const sms_consent = document.getElementById('f-consent').checked;
     const unit     = document.getElementById('f-unit').value.trim();
     const property = document.getElementById('f-property').value.trim();
     const issue    = document.getElementById('f-issue').value.trim();
@@ -438,6 +405,7 @@ FORM_HTML = f"""
     if (!unit)     missing.push('Flat / Unit');
     if (!property) missing.push('Property');
     if (!issue)    missing.push('Issue Description');
+    if (sms_consent && !phone) missing.push('Mobile (needed for text updates)');
 
     const errBox = document.getElementById('errorBox');
     if (missing.length) {{
@@ -451,17 +419,20 @@ FORM_HTML = f"""
     btn.disabled = true; btn.textContent = 'Submitting…';
 
     try {{
-      const res = await fetch('http://127.0.0.1:{_API_PORT}/submit', {{
+      const res = await fetch({json.dumps(_SUBMIT_URL)}, {{
         method:  'POST',
         headers: {{ 'Content-Type': 'application/json' }},
-        body:    JSON.stringify({{ name, email, unit, property_name: property, issue }})
+        body:    JSON.stringify({{ name, email, phone, sms_consent, unit, property_name: property, issue,
+                                   website: document.getElementById('f-website').value }})
       }});
+      const body = await res.json().catch(() => ({{}}));
       if (res.ok) {{
+        document.getElementById('successRef').textContent = String(body.id || '').slice(0, 8).toUpperCase();
         document.getElementById('successName').textContent = name.split(' ')[0];
         document.getElementById('form-view').style.display    = 'none';
         document.getElementById('success-view').style.display = 'block';
       }} else {{
-        showErr('Submission failed — please try again.');
+        showErr(body.error ? ('Submission failed: ' + body.error) : 'Submission failed, please try again.');
       }}
     }} catch (_) {{
       showErr('Could not reach the server. Make sure the app is running.');
@@ -476,7 +447,8 @@ FORM_HTML = f"""
   }}
 
   function resetForm() {{
-    ['f-name','f-email','f-unit','f-property','f-issue'].forEach(id =>
+    document.getElementById('f-consent').checked = false;
+    ['f-name','f-email','f-phone','f-unit','f-property','f-issue'].forEach(id =>
       document.getElementById(id).value = '');
     accumulated = '';
     document.getElementById('form-view').style.display    = 'block';
@@ -487,12 +459,12 @@ FORM_HTML = f"""
 </html>
 """
 
-components.html(FORM_HTML, height=560, scrolling=False)
+embed_html(FORM_HTML, height=640, scrolling=False)
 
 st.markdown(
     "<div style=\"margin-top:28px;text-align:center;font-size:11px;color:#4A4A3F;"
     "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif\">"
-    "Powered by Lette · Your report is reviewed by your property manager"
+    "Powered by Hearthline · Your report is reviewed by your property manager"
     "</div>",
     unsafe_allow_html=True,
 )
