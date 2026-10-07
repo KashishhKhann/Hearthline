@@ -18,6 +18,8 @@ Every resident message (email, web form, SMS, WhatsApp) is scored, routed and an
 
 ---
 
+**Contents:** [Why](#why) · [Features](#what-it-does) · [How it works](#how-it-works) · [Triage brain](#inside-the-triage-brain) · [Critical alerts](#critical-alerts) · [Replying](#replying-to-residents) · [Contractors](#contractor-dispatch) · [Lifecycle](#conversation-lifecycle) · [Data model](#data-model) · [Quick start](#quick-start) · [Going live](#going-live) · [Testing](#testing-and-evaluation)
+
 ## Why
 
 A property manager's inbox mixes a burst pipe, an RTB dispute, a journalist, a wifi question and a contractor invoice, all in the same list. Hearthline sorts that list so the dangerous and legally sensitive messages come first, drafts replies for the routine ones, and makes sure a critical issue at 2am wakes somebody up.
@@ -58,16 +60,92 @@ flowchart LR
     api -->|texts, calls| twilio["Twilio / SendGrid"]
     dash["Manager dashboard<br/>(Streamlit)"] --> brain
     dash --> db
-    dash -->|Approve & Send, dispatch| twilio
+    dash -->|Approve and Send, dispatch| twilio
 ```
 
 - **The API is the only door in.** Every inbound message is validated, stored and triaged the moment it arrives, so critical issues are paged without anyone opening the dashboard.
 - **Everything becomes an email-shaped record**, so one set of rules handles every channel.
 - **Rules decide, the LLM only writes.** Urgency and tier are deterministic and explained line by line; the model can't make a leak non-urgent.
 
-Design notes, the original code review and a changelog are in [`REVIEW_AND_ROADMAP.md`](REVIEW_AND_ROADMAP.md).
+### Life of a text message
 
-### Scoring at a glance
+From a resident's text to an acknowledged on-call alert, usually within seconds:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor R as Resident
+    participant T as Twilio
+    participant A as Hearthline API
+    participant DB as SQLite
+    participant B as Triage brain
+    actor M as On-call manager
+    R->>T: "Water pouring through my ceiling"
+    T->>A: POST /webhooks/twilio/messaging (signed)
+    A->>A: Verify X-Twilio-Signature, normalise number to E.164
+    A->>DB: Join open conversation or start a new one
+    A-->>T: TwiML reply: reference + safety tip
+    T-->>R: "Logged (ref 8829EDB9). Switch off at the fuse board..."
+    A->>B: Background: triage this conversation
+    B-->>A: critical, score 100
+    A->>T: SMS to on-call: "Reply ACK E20BEF"
+    T->>M: Alert text
+    M->>T: "ACK E20BEF"
+    T->>A: POST /webhooks/twilio/messaging
+    A->>DB: Mark alert acknowledged (audit log)
+    A-->>M: "Thanks, you've got it"
+```
+
+The resident's reply (step 5) goes out before triage runs, so Twilio never waits on the triage step. Web-form reports and emails take the same path from step 4 onwards.
+
+## Inside the triage brain
+
+Every message, whatever the channel, goes through the same pipeline:
+
+```mermaid
+flowchart TD
+    subgraph IN["Ingest (ingest.py)"]
+        s1["Sample emails<br/>(JSON)"] --> flat
+        s2["Stored conversations<br/>(form, SMS, WhatsApp, email)"] -->|converted to<br/>email-shaped rows| flat
+        flat["Flatten + clean<br/>types, ISO timestamps,<br/>recipient lists"] --> prop["Work out the building<br/>1. thread senders<br/>2. inbox it was sent to<br/>3. building name in text"]
+    end
+    prop --> grp["Group into threads"]
+    grp --> cls["Issue type<br/>(scoring.classify_issue)"]
+    cls --> score["Urgency 0-100 + reasons<br/>(scoring.score_urgency)"]
+    score --> sent["Sentiment"]
+    sent --> tier{"Choose tier"}
+    tier --> llm["LLM text, 4 threads at a time<br/>(summary, action, draft)<br/>or deterministic fallback"]
+    llm --> sort["Sort: urgency, then<br/>human before ai before auto"]
+    sort --> themes["Portfolio themes<br/>(themes.py)"]
+```
+
+### How a thread gets its tier
+
+Human rules are checked first; auto-replies have to clear every gate, so anything doubtful lands in the AI tier, where a person reviews the draft.
+
+```mermaid
+flowchart TD
+    start(["Thread"]) --> human{"Any human rule fires?"}
+    rules["Human rules, first match wins:<br/>1. tenant thread with 3+ messages<br/>2. tenant writes again after a contractor or manager reply<br/>3. a described fix that failed<br/>4. welfare signal: smell + not seen / post piling up<br/>5. RTB, solicitor, tribunal, or a regulator raising<br/>a dispute, breach or non-compliance<br/>6. escalation words (compensation, environmental<br/>health...) in a multi-email thread<br/>7. press or media contact"] -.-> human
+    human -->|yes| HUMAN["HUMAN<br/>manager handles it personally,<br/>no draft"]
+    human -->|no| faq{"FAQ template matches the<br/>tenant's first message?"}
+    faq -->|no| AI["AI<br/>draft ready to review and send"]
+    faq -->|yes| safe{"No danger words anywhere,<br/>tenant-started, general issue,<br/>calm tone?"}
+    safe -->|no| AI
+    safe -->|yes| llm{"LLM configured and it says<br/>the template doesn't fit?"}
+    llm -->|yes| AI
+    llm -->|"no, or no model"| AUTO["AUTO<br/>FAQ template answer,<br/>urgency capped at 25"]
+    classDef human fill:#111,color:#fff,stroke:#111
+    classDef ai fill:#dadfd1,stroke:#8a9a80,color:#111
+    classDef auto fill:#f3f3f1,stroke:#999,color:#111
+    classDef note fill:#fff,stroke:#bbb,color:#333,text-align:left
+    class HUMAN human
+    class AI ai
+    class AUTO auto
+    class rules note
+```
+
+### How urgency is scored
 
 | Signal | Points |
 | --- | --- |
@@ -80,6 +158,155 @@ Design notes, the original code review and a changelog are in [`REVIEW_AND_ROADM
 | Unread inbound, attachments, waiting for a reply | up to +20, +8, +12 |
 
 80+ is critical, 60+ high, 35+ medium. Keyword matching is word-boundary aware, so "RTÉ" doesn't match "reported" and "bin" doesn't match "plumbing".
+
+## Critical alerts
+
+Critical issues reach a person by text immediately, and by phone if nobody answers:
+
+```mermaid
+flowchart TD
+    new(["New message saved"]) --> tri["Triage this conversation"]
+    tri --> crit{"Critical, or health/safety<br/>or welfare flag?"}
+    crit -->|no| none["No alert<br/>normal inbox"]
+    crit -->|yes| dup{"Already alerted<br/>for this thread?"}
+    dup -->|yes| none
+    dup -->|no| text["Text first on-call number<br/>'Reply ACK 3F9A2C to take it'"]
+    text --> ack{"ACK within<br/>ALERT_ACK_TIMEOUT_MIN?"}
+    ack -->|yes, by SMS or dashboard| done["Acknowledged<br/>who + when in audit log"]
+    ack -->|no| phonecall["Phone the next person on the rota<br/>'Press 1 to take this issue'"]
+    phonecall --> press{"Pressed 1?"}
+    press -->|yes| done
+    press -->|no answer| open["Stays open in the dashboard<br/>(ack from there)"]
+    classDef good fill:#e3f0e3,stroke:#4a8a4a,color:#111
+    class done good
+```
+
+Configure the rota with `ONCALL_NUMBERS` (first number is texted first) and the timeout with `ALERT_ACK_TIMEOUT_MIN` (default 10).
+
+## Replying to residents
+
+**Approve & Send** works out the right channel before you click, and never texts someone who hasn't agreed to it:
+
+```mermaid
+flowchart TD
+    click(["Approve and Send"]) --> src{"Where did the<br/>thread come from?"}
+    src -->|SMS / WhatsApp| stop{"Resident texted STOP?"}
+    stop -->|yes| blocked["Blocked:<br/>can't text them"]
+    stop -->|no| viasms["Reply on the same channel<br/>and number"]
+    src -->|Email| viaemail["Reply by email<br/>(SendGrid)"]
+    src -->|Web form| consent{"Gave a mobile and ticked<br/>'Text me updates'?<br/>Not opted out?"}
+    consent -->|yes| viasms2["Reply by SMS"]
+    consent -->|no| hasmail{"Left an email?"}
+    hasmail -->|yes| viaemail
+    hasmail -->|no| nope["No route:<br/>button explains why"]
+    src -->|Sample dataset email| viaemail
+    viasms --> rec["Saved as outbound message,<br/>delivery receipts update it,<br/>New becomes In progress"]
+    viasms2 --> rec
+    viaemail --> rec
+```
+
+## Contractor dispatch
+
+```mermaid
+sequenceDiagram
+    actor M as Manager
+    participant D as Dashboard
+    participant T as Twilio
+    actor C as Contractor
+    participant A as Hearthline API
+    M->>D: Dispatch a contractor by text
+    D->>T: SMS "Hearthline job 4821: Graylings, 4C: intercom dead.<br/>Reply YES 4821 / NO 4821 / DONE 4821"
+    T->>C: Job offer
+    C->>T: "YES 4821"
+    T->>A: POST /webhooks/twilio/messaging
+    A->>A: Sender is a known contractor: job 4821 accepted
+    A-->>C: "Thanks, job 4821 is yours"
+    Note over D: Thread shows "Job 4821 · accepted"
+    C->>T: "DONE 4821"
+    T->>A: webhook
+    A-->>C: "Thanks, job 4821 marked as done"
+```
+
+Contractor texts are recognised by their number, so they never show up as resident conversations.
+
+## Conversation lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> New: report, text or email arrives
+    New --> InProgress: Mark in progress, reply sent,<br/>or contractor dispatched
+    InProgress --> Resolved: Mark resolved
+    New --> Resolved: Mark resolved
+    InProgress --> New: resident writes again
+    Resolved --> New: Reopen
+    Resolved --> [*]: a new text after this starts<br/>a fresh conversation
+    InProgress: In progress
+```
+
+## Data model
+
+Everything that isn't sample data lives in one SQLite file (`data/hearthline.db`) behind `store.py`:
+
+```mermaid
+erDiagram
+    CONVERSATIONS ||--o{ MESSAGES : contains
+    CONVERSATIONS ||--o{ ALERTS : "pages on-call for"
+    CONVERSATIONS ||--o{ JOBS : "dispatches"
+    CONTRACTORS ||--o{ JOBS : "accepts or declines"
+    RESIDENTS |o--o{ CONVERSATIONS : "phone links to"
+    CONVERSATIONS ||--o{ AUDIT_LOG : "history of"
+    CONVERSATIONS {
+        text id PK
+        text channel "portal, sms, whatsapp, email"
+        text contact "E.164 phone or email"
+        text unit
+        text property_name
+        text status "new, in_progress, resolved"
+    }
+    MESSAGES {
+        text id PK
+        text conversation_id FK
+        text direction "inbound or outbound"
+        text body
+        text provider_sid "Twilio message id"
+        text delivery_status
+        text sent_by
+    }
+    RESIDENTS {
+        text phone PK
+        text unit
+        int sms_consent
+        int opted_out "texted STOP"
+    }
+    ALERTS {
+        text id PK
+        text thread_id
+        text channel "sms or voice"
+        text ack_code
+        text acked_by
+        text escalated_at
+    }
+    CONTRACTORS {
+        text id PK
+        text name
+        text trade
+        text phone
+    }
+    JOBS {
+        text id PK
+        text code "4 digits"
+        text contractor_id FK
+        text status "offered, accepted, declined, done"
+    }
+    AUDIT_LOG {
+        int id PK
+        text actor
+        text action
+        text detail
+    }
+```
+
+Design notes, the original code review and a changelog are in [`REVIEW_AND_ROADMAP.md`](REVIEW_AND_ROADMAP.md).
 
 ## Quick start
 
