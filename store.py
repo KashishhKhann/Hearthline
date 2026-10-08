@@ -460,22 +460,42 @@ def latest_unacked_alert_for(recipient: str, path: Path | str | None = None) -> 
     return dict(row) if row else None
 
 
-def sms_alerts_due_for_escalation(older_than: timedelta, path: Path | str | None = None) -> list[dict]:
-    """SMS alerts with no acknowledgement and no voice escalation yet, older than the timeout."""
+def alerts_due_for_escalation(older_than: timedelta, path: Path | str | None = None,
+                              channel: str | None = None) -> list[dict]:
+    """Alerts (SMS or call) with no acknowledgement and not yet escalated, older than the timeout,
+    on threads nobody has picked up yet."""
     cutoff = (datetime.now(timezone.utc) - older_than).strftime("%Y-%m-%dT%H:%M:%SZ")
+    sql = ("SELECT a.* FROM alerts a WHERE a.acked_at IS NULL AND a.escalated_at IS NULL"
+           " AND a.created_at <= ? AND NOT EXISTS (SELECT 1 FROM alerts b WHERE b.thread_id = a.thread_id"
+           " AND b.acked_at IS NOT NULL)")
+    params: list = [cutoff]
+    if channel:
+        sql += " AND a.channel = ?"
+        params.append(channel)
     with connect(path) as conn:
-        rows = conn.execute(
-            "SELECT a.* FROM alerts a WHERE a.channel = 'sms' AND a.acked_at IS NULL AND a.escalated_at IS NULL"
-            " AND a.created_at <= ? AND NOT EXISTS (SELECT 1 FROM alerts b WHERE b.thread_id = a.thread_id"
-            " AND b.acked_at IS NOT NULL)",
-            (cutoff,),
-        ).fetchall()
+        rows = conn.execute(sql + " ORDER BY a.created_at", params).fetchall()
     return [dict(r) for r in rows]
 
 
-def mark_escalated(alert_id: str, path: Path | str | None = None) -> None:
+def sms_alerts_due_for_escalation(older_than: timedelta, path: Path | str | None = None) -> list[dict]:
+    """SMS alerts with no acknowledgement and no voice escalation yet, older than the timeout."""
+    return alerts_due_for_escalation(older_than, path, channel="sms")
+
+
+def voice_calls_for_thread(thread_id: str, path: Path | str | None = None) -> int:
     with connect(path) as conn:
-        conn.execute("UPDATE alerts SET escalated_at = ? WHERE id = ?", (now_iso(), alert_id))
+        row = conn.execute("SELECT COUNT(*) FROM alerts WHERE thread_id = ? AND channel = 'voice'",
+                           (thread_id,)).fetchone()
+    return int(row[0])
+
+
+def mark_escalated(alert_id: str, path: Path | str | None = None) -> bool:
+    """Claim an alert for escalation. Returns False if it was already escalated (so two
+    workers, e.g. the sweep and a 'press 2' on a call, never phone the same person twice)."""
+    with connect(path) as conn:
+        cur = conn.execute("UPDATE alerts SET escalated_at = ? WHERE id = ? AND escalated_at IS NULL",
+                           (now_iso(), alert_id))
+    return cur.rowcount > 0
 
 
 # ── Contractors & jobs ────────────────────────────────────────────────────────

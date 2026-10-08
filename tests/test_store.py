@@ -71,6 +71,14 @@ def test_alert_ack_and_escalation_query():
     assert store.sms_alerts_due_for_escalation(timedelta(minutes=-1)) == []
 
 
+def test_mark_escalated_claims_once():
+    aid = store.create_alert("conv_y", "critical", "+353870000001", "sms", "sent", "DEF456")
+    assert store.alerts_due_for_escalation(timedelta(minutes=-1))[0]["id"] == aid
+    assert store.mark_escalated(aid) is True
+    assert store.mark_escalated(aid) is False
+    assert store.alerts_due_for_escalation(timedelta(minutes=-1)) == []
+
+
 def test_migrate_legacy_json(tmp_path):
     legacy = tmp_path / "resident_reports.json"
     legacy.write_text(json.dumps([{**report(), "id": "old1", "timestamp": "2026-03-01T10:00:00Z"},

@@ -245,4 +245,9 @@ Roadmap items 3 (real backend) and most of section 4 (Twilio) are now built.
 - **Twilio Verify login (4.6):** optional texted code after the password, counted in the same lockout, never faked in dry-run.
 - **Tests:** 102 passing. CI lints `eval/` too.
 
-Open: the alert-escalation question (keep ringing the rota after an unanswered call, or leave it open as now), Postgres for multi-process deployments, per-user dashboard accounts.
+### Round 6 (8 Oct 2026)
+
+- **Escalation keeps going round the rota:** an unanswered call (or "press 2") now moves the alert to the next person, one call per timeout, until someone presses 1 or replies ACK. After one full round of calls (one per number on the rota) it stops, logs `escalation_exhausted` and stays open on the dashboard. Each alert is claimed atomically, so the sweep and a "press 2" can't both ring the same person.
+- **Tests:** 155 passing (rota walk, ACK stopping further calls, single-number rota, claim-once, press 2).
+
+Open: Postgres for multi-process deployments, per-user dashboard accounts.

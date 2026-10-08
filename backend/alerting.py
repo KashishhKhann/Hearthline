@@ -1,10 +1,12 @@
 """Critical-issue alerting: triage a single conversation as soon as it arrives and,
 if it is critical, text the on-call manager. If nobody acknowledges within the
-timeout, escalate to a phone call.
+timeout, phone the next person on the rota, and keep going down the rota every
+timeout until someone presses 1 or replies ACK. It stops after one full round of
+calls (one call per number on the rota) and leaves the alert open on the dashboard.
 
 Environment:
     ONCALL_NUMBERS          comma-separated E.164 numbers, first = primary on-call
-    ALERT_ACK_TIMEOUT_MIN   minutes before an unacknowledged SMS alert becomes a call (default 10)
+    ALERT_ACK_TIMEOUT_MIN   minutes before an unacknowledged alert moves to the next person (default 10)
     HEARTHLINE_PUBLIC_URL   public base URL of this API (needed for voice-call TwiML)
 """
 from __future__ import annotations
@@ -95,28 +97,52 @@ def maybe_alert(conversation_id: str, notifier: Notifier | None = None, db_path=
     return store.create_alert(thread_id, reason, numbers[0], "sms", status, ack_code, result.sid, db_path)
 
 
-def escalate_due_alerts(notifier: Notifier | None = None, db_path=None) -> list[str]:
-    """Phone the on-call for SMS alerts that weren't acknowledged in time.
+def _next_number(recipient: str, numbers: list[str]) -> str:
+    if numbers and recipient in numbers:
+        return numbers[(numbers.index(recipient) + 1) % len(numbers)]
+    return numbers[0] if numbers else recipient
 
-    The call goes to the next number on the rota after the one that was texted
-    (or back to the same number if there is only one).
+
+def escalate_alert(alert: dict, notifier: Notifier | None = None, db_path=None) -> str | None:
+    """Phone the next person on the rota about an unacknowledged alert.
+
+    Returns the new voice alert id, or None if the alert was already escalated, the
+    thread has been picked up, or a full round of calls has been made.
+    """
+    if not store.mark_escalated(alert["id"], db_path):
+        return None  # someone else (sweep or a 'press 2') already moved this one on
+    thread_id = alert["thread_id"]
+    if store.thread_acknowledged(thread_id, db_path):
+        return None
+    numbers = oncall_numbers()
+    max_calls = max(len(numbers), 1)
+    if store.voice_calls_for_thread(thread_id, db_path) >= max_calls:
+        with store.connect(db_path) as conn:
+            store.audit(conn, "system", "escalation_exhausted", thread_id, {"calls": max_calls})
+        log.warning("Alert for %s unanswered after a full round of %s call(s); left open", thread_id, max_calls)
+        return None
+    target = _next_number(alert["recipient"], numbers)
+    alert_id = str(uuid.uuid4())
+    twiml_url = public_url(f"/webhooks/twilio/voice/alert/{alert_id}")
+    result = (notifier or Notifier()).place_call(target, twiml_url)
+    status = "dry_run" if result.dry_run else ("sent" if result.ok else "failed")
+    store.create_alert(thread_id, alert["reason"], target, "voice", status,
+                       alert["ack_code"], result.sid, db_path, alert_id=alert_id)
+    log.info("Escalated alert %s to a call to %s (%s)", alert["id"], target, status)
+    return alert_id
+
+
+def escalate_due_alerts(notifier: Notifier | None = None, db_path=None) -> list[str]:
+    """Move every alert nobody acknowledged in time on to the next person, by phone.
+
+    SMS to the first number -> call the second -> call the third ... until someone
+    presses 1 / replies ACK, or every number on the rota has been called once.
     """
     timeout = timedelta(minutes=env_int("ALERT_ACK_TIMEOUT_MIN", 10))
     notifier = notifier or Notifier()
-    numbers = oncall_numbers()
     created: list[str] = []
-    for alert in store.sms_alerts_due_for_escalation(timeout, db_path):
-        if numbers and alert["recipient"] in numbers:
-            target = numbers[(numbers.index(alert["recipient"]) + 1) % len(numbers)]
-        else:
-            target = alert["recipient"]
-        alert_id = str(uuid.uuid4())
-        twiml_url = public_url(f"/webhooks/twilio/voice/alert/{alert_id}")
-        result = notifier.place_call(target, twiml_url)
-        status = "dry_run" if result.dry_run else ("sent" if result.ok else "failed")
-        store.create_alert(alert["thread_id"], alert["reason"], target, "voice", status,
-                           alert["ack_code"], result.sid, db_path, alert_id=alert_id)
-        store.mark_escalated(alert["id"], db_path)
-        created.append(alert_id)
-        log.info("Escalated alert %s to a call to %s (%s)", alert["id"], target, status)
+    for alert in store.alerts_due_for_escalation(timeout, db_path):
+        new_id = escalate_alert(alert, notifier, db_path)
+        if new_id:
+            created.append(new_id)
     return created

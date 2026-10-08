@@ -31,7 +31,7 @@ A property manager's inbox mixes a burst pipe, an RTB dispute, a journalist, a w
 | **Explainable triage** | Each thread gets an issue type, a 0 to 100 urgency score with a written reason for every point, sentiment, risk flags and an owner. |
 | **Three handling tiers** | `human` (legal, RTB, media, welfare, repeat failures: never auto-drafted), `ai` (draft ready for review), `auto` (simple FAQ answered from a template). |
 | **Every channel, one inbox** | Web form with voice dictation, SMS and WhatsApp via Twilio, and email via SendGrid Inbound Parse, all triaged by the same rules. |
-| **On-call escalation** | Critical issues text the on-call manager ("Reply ACK 3F9A2C"). No ACK in 10 minutes, and the next person on the rota gets a phone call ("Press 1 to take this issue"). |
+| **On-call escalation** | Critical issues text the on-call manager ("Reply ACK 3F9A2C"). No ACK in 10 minutes, and the next person on the rota gets a phone call ("Press 1 to take this issue"), and so on round the rota until someone takes it. |
 | **Approve & Send** | One click replies by SMS, WhatsApp or email, respecting consent and STOP. Delivery receipts come back from Twilio. |
 | **Contractor dispatch** | Text a job to a plumber or electrician with a 4-digit code; their `YES 4821` / `DONE 4821` replies update the job. |
 | **Optional LLM** | Any OpenAI-compatible model (e.g. Mistral via LM Studio) writes summaries and drafts and double-checks auto-replies. The rules still decide urgency and tier, and everything works with no model at all. |
@@ -176,12 +176,14 @@ flowchart TD
     ack -->|no| phonecall["Phone the next person on the rota<br/>'Press 1 to take this issue'"]
     phonecall --> press{"Pressed 1?"}
     press -->|yes| done
-    press -->|no answer| open["Stays open in the dashboard<br/>(ack from there)"]
+    press -->|"no answer, or pressed 2"| round{"Everyone on the rota<br/>called once?"}
+    round -->|no| phonecall
+    round -->|yes| open["Stays open in the dashboard<br/>(ack from there)"]
     classDef good fill:#e3f0e3,stroke:#4a8a4a,color:#111
     class done good
 ```
 
-Configure the rota with `ONCALL_NUMBERS` (first number is texted first) and the timeout with `ALERT_ACK_TIMEOUT_MIN` (default 10).
+Configure the rota with `ONCALL_NUMBERS` (first number is texted first) and the timeout with `ALERT_ACK_TIMEOUT_MIN` (default 10). With a rota of A, B, C: text A, then call B, C and A in turn, one every timeout, until someone takes it. Pressing 2 on a call passes it to the next person straight away.
 
 ## Replying to residents
 
@@ -371,7 +373,7 @@ All settings are documented in [`.env.example`](.env.example).
 ## Testing and evaluation
 
 ```bash
-pytest                                            # 150 tests, ~3 seconds, no network
+pytest                                            # 155 tests, ~3 seconds, no network
 python -m pyflakes *.py pages/*.py backend/*.py eval/*.py tests/*.py
 ```
 

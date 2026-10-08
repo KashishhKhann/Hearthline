@@ -221,7 +221,47 @@ def test_unacked_alert_escalates_to_next_oncall_by_voice(monkeypatch):
     assert len(created) == 1
     kind, to, url = fake.sent[-1]
     assert kind == "call" and to == "+353860000002" and url.endswith(f"/voice/alert/{created[0]}")
-    assert alerting.escalate_due_alerts(fake) == []  # escalates once
+    # Still nobody: the call moves round the rota to the first number, then stops.
+    second = alerting.escalate_due_alerts(fake)
+    assert len(second) == 1 and fake.sent[-1][1] == "+353860000001"
+    assert alerting.escalate_due_alerts(fake) == []  # one full round of calls, then left open
+
+
+def test_escalation_walks_the_rota_until_acknowledged(monkeypatch):
+    monkeypatch.setenv("ONCALL_NUMBERS", "+353860000001,+353860000002,+353860000003")
+    monkeypatch.setenv("ALERT_ACK_TIMEOUT_MIN", "-1")
+    cid, _ = store.record_inbound_message("+353871234567", CRITICAL, "sms")
+    fake = FakeNotifier()
+    alerting.maybe_alert(cid, fake)
+    alerting.escalate_due_alerts(fake)
+    assert fake.sent[-1][:2] == ("call", "+353860000002")
+    alerting.escalate_due_alerts(fake)
+    assert fake.sent[-1][:2] == ("call", "+353860000003")
+    store.acknowledge_alerts(f"conv_{cid}", "+353860000003")
+    calls = len(fake.sent)
+    assert alerting.escalate_due_alerts(fake) == []  # picked up: nobody else is called
+    assert len(fake.sent) == calls
+
+
+def test_single_number_rota_calls_once(monkeypatch):
+    monkeypatch.setenv("ONCALL_NUMBERS", "+353860000001")
+    monkeypatch.setenv("ALERT_ACK_TIMEOUT_MIN", "-1")
+    cid, _ = store.record_inbound_message("+353871234567", CRITICAL, "sms")
+    fake = FakeNotifier()
+    alerting.maybe_alert(cid, fake)
+    assert len(alerting.escalate_due_alerts(fake)) == 1
+    assert fake.sent[-1][:2] == ("call", "+353860000001")
+    assert alerting.escalate_due_alerts(fake) == []
+
+
+def test_escalate_alert_is_claimed_once(monkeypatch):
+    monkeypatch.setenv("ONCALL_NUMBERS", "+353860000001,+353860000002")
+    cid, _ = store.record_inbound_message("+353871234567", CRITICAL, "sms")
+    fake = FakeNotifier()
+    alerting.maybe_alert(cid, fake)
+    alert = store.alerts_for_thread(f"conv_{cid}")[0]
+    assert alerting.escalate_alert(alert, fake) is not None
+    assert alerting.escalate_alert(alert, fake) is None  # sweep and 'press 2' can't both call
 
 
 def test_voice_flow_press_1_acknowledges(client, monkeypatch):
@@ -233,6 +273,17 @@ def test_voice_flow_press_1_acknowledges(client, monkeypatch):
     r = signed_post(client, f"/webhooks/twilio/voice/ack/{aid}", {"Digits": "1"})
     assert "assigned to you" in twiml_text(r)
     assert store.thread_acknowledged(f"conv_{cid}")
+
+
+def test_voice_press_2_calls_next_person_now(client, monkeypatch):
+    monkeypatch.setenv("ONCALL_NUMBERS", "+353860000001,+353860000002")
+    cid, _ = store.record_inbound_message("+353871234567", CRITICAL, "sms")
+    aid = store.create_alert(f"conv_{cid}", "critical 100", "+353860000001", "voice", "sent", "ABC123")
+    r = signed_post(client, f"/webhooks/twilio/voice/ack/{aid}", {"Digits": "2"})
+    assert "next person" in twiml_text(r)
+    calls = [a for a in store.alerts_for_thread(f"conv_{cid}") if a["channel"] == "voice"]
+    assert {a["recipient"] for a in calls} == {"+353860000001", "+353860000002"}
+    assert not store.thread_acknowledged(f"conv_{cid}")
 
 
 # ── Replies ───────────────────────────────────────────────────────────────────

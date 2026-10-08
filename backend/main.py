@@ -256,13 +256,15 @@ async def voice_alert(alert_id: str, _form: dict = Depends(twilio_form)):
 
 
 @app.post("/webhooks/twilio/voice/ack/{alert_id}")
-async def voice_ack(alert_id: str, form: dict = Depends(twilio_form)):
+async def voice_ack(alert_id: str, background: BackgroundTasks, form: dict = Depends(twilio_form)):
     alert = store.get_alert(alert_id)
     if alert is None:
         return _twiml("<Say>Alert not found. Goodbye.</Say>")
     if form.get("Digits") == "1":
         store.acknowledge_alerts(alert["thread_id"], alert["recipient"])
         return _twiml("<Say>Thank you. The issue is assigned to you. Details are in the Hearthline dashboard. Goodbye.</Say>")
+    # "Press 2 to pass it on": call the next person now rather than waiting for the timeout.
+    background.add_task(alerting.escalate_alert, alert)
     return _twiml("<Say>Understood. We will contact the next person on call. Goodbye.</Say>")
 
 
