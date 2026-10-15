@@ -508,3 +508,19 @@ def test_ack_works_when_rota_number_has_irish_trunk_zero(client, monkeypatch):
     code = store.alerts_for_thread(f"conv_{cid}")[0]["ack_code"]
     r = signed_post(client, "/webhooks/twilio/messaging", {"From": "+353860000001", "Body": f"ACK {code}"})
     assert "acknowledged" in twiml_text(r)
+
+
+def test_trial_template_error_is_explained(monkeypatch):
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "AC" + "0" * 32)
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "t")
+    monkeypatch.setenv("TWILIO_FROM_NUMBER", "+4915888620339")
+    monkeypatch.delenv("HEARTHLINE_DRY_RUN", raising=False)
+
+    class Messages:
+        def create(self, **kw):
+            raise RuntimeError("Unable to create record: Invalid template name. Trial accounts can only use "
+                               "predefined SMS templates. https://www.twilio.com/docs/errors/572006")
+
+    n = Notifier(client=type("C", (), {"messages": Messages()})())
+    result = n.send_sms("+353871234567", "hi")
+    assert not result.ok and "572006" in result.error and "Upgrade" in result.error

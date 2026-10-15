@@ -40,6 +40,17 @@ def _dry_run_result(kind: str, to: str, body: str) -> SendResult:
     return SendResult(ok=True, sid=f"DRYRUN-{uuid.uuid4().hex[:12]}", status="dry_run", dry_run=True)
 
 
+TRIAL_TEMPLATE_HINT = ("This Twilio trial can only send Twilio's predefined templates (error 572006). "
+                       "Upgrade the Twilio account to send Hearthline's own messages.")
+
+
+def _friendly_error(exc: Exception) -> str:
+    text = str(exc)
+    if "572006" in text or "predefined SMS templates" in text:
+        return TRIAL_TEMPLATE_HINT
+    return text
+
+
 class Notifier:
     def __init__(self, client=None) -> None:
         self.account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
@@ -88,7 +99,7 @@ class Notifier:
             message = self._twilio().messages.create(**kwargs)
         except Exception as exc:  # noqa: BLE001 - surface any provider error to the caller
             log.warning("Twilio send failed to %s: %s", to, exc)
-            return SendResult(ok=False, sid=None, status="failed", error=str(exc))
+            return SendResult(ok=False, sid=None, status="failed", error=_friendly_error(exc))
         return SendResult(ok=True, sid=message.sid, status=str(getattr(message, "status", "queued")))
 
     # ── Voice ────────────────────────────────────────────────────────────────
@@ -99,7 +110,7 @@ class Notifier:
             call = self._twilio().calls.create(to=to, from_=self.from_number, url=twiml_url)
         except Exception as exc:  # noqa: BLE001
             log.warning("Twilio call failed to %s: %s", to, exc)
-            return SendResult(ok=False, sid=None, status="failed", error=str(exc))
+            return SendResult(ok=False, sid=None, status="failed", error=_friendly_error(exc))
         return SendResult(ok=True, sid=call.sid, status=str(getattr(call, "status", "queued")))
 
     # ── Email (SendGrid) ─────────────────────────────────────────────────────
@@ -121,7 +132,7 @@ class Notifier:
             response.raise_for_status()
         except Exception as exc:  # noqa: BLE001
             log.warning("SendGrid send failed to %s: %s", to, exc)
-            return SendResult(ok=False, sid=None, status="failed", error=str(exc))
+            return SendResult(ok=False, sid=None, status="failed", error=_friendly_error(exc))
         return SendResult(ok=True, sid=response.headers.get("X-Message-Id"), status="sent")
 
     # ── One-time login codes (Twilio Verify) ─────────────────────────────────
@@ -132,7 +143,7 @@ class Notifier:
             v = self._twilio().verify.v2.services(self.verify_sid).verifications.create(to=to, channel="sms")
         except Exception as exc:  # noqa: BLE001
             log.warning("Verify start failed for %s: %s", to, exc)
-            return SendResult(ok=False, sid=None, status="failed", error=str(exc))
+            return SendResult(ok=False, sid=None, status="failed", error=_friendly_error(exc))
         return SendResult(ok=True, sid=getattr(v, "sid", None), status=str(getattr(v, "status", "pending")))
 
     def check_verification(self, to: str, code: str) -> bool:

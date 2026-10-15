@@ -141,8 +141,16 @@ def main(argv: list[str] | None = None) -> int:
         if not from_:
             print(f"Can't send a test to {to}: set TWILIO_FROM_NUMBER (SMS) or use a whatsapp: on-call entry.")
             return 1
-        msg = client.messages.create(to=to, from_=from_,
-                                     body="Hearthline is live. Message this number to report an issue.")
+        try:
+            msg = client.messages.create(to=to, from_=from_,
+                                         body="Hearthline is live. Message this number to report an issue.")
+        except Exception as exc:  # noqa: BLE001 - show the reason, not a traceback
+            if "572006" in str(exc):
+                print("Test message blocked: this Twilio trial only sends Twilio's predefined templates.\n"
+                      "  Incoming texts still reach Hearthline; Hearthline's own texts need an upgraded account.")
+            else:
+                print(f"Test message failed: {exc}")
+            return 1
         print(f"Test message sent to {to} ({msg.sid})")
 
     print("\nNext: restart the API (scripts/dev.sh), then text the number from your phone.")
