@@ -52,3 +52,22 @@ def test_configure_number_sets_webhooks():
 
 def test_no_ngrok_returns_none():
     assert go_live.ngrok_public_url("http://127.0.0.1:9/none") is None
+
+
+def test_simulated_sms_passes_the_api_signature_check(monkeypatch):
+    from fastapi.testclient import TestClient
+    from backend import main
+
+    sim_spec = importlib.util.spec_from_file_location(
+        "simulate_sms", Path(__file__).parents[1] / "scripts" / "simulate_sms.py")
+    sim = importlib.util.module_from_spec(sim_spec)
+    sim_spec.loader.exec_module(sim)
+    monkeypatch.delenv("HEARTHLINE_INSECURE_WEBHOOKS", raising=False)
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("HEARTHLINE_PUBLIC_URL", "https://abc.ngrok.app")
+    env = {"TWILIO_AUTH_TOKEN": "test-token", "HEARTHLINE_PUBLIC_URL": "https://abc.ngrok.app"}
+    url, form, headers = sim.build_request(env, "+353871234567", "Water pouring through my ceiling",
+                                           "http://testserver")
+    with TestClient(main.app) as client:
+        r = client.post("/webhooks/twilio/messaging", data=form, headers=headers)
+    assert r.status_code == 200 and "logged this" in r.text
