@@ -55,7 +55,8 @@ class Notifier:
     # ── capability checks ────────────────────────────────────────────────────
     @property
     def twilio_live(self) -> bool:
-        return not self.force_dry_run and bool(self.account_sid and self.auth_token and self.from_number)
+        return not self.force_dry_run and bool(self.account_sid and self.auth_token
+                                               and (self.from_number or self.whatsapp_from))
 
     @property
     def verify_live(self) -> bool:
@@ -77,9 +78,10 @@ class Notifier:
     def send_sms(self, to: str, body: str, status_callback: str | None = None) -> SendResult:
         body = body[:MAX_SMS_CHARS]
         is_whatsapp = to.startswith("whatsapp:")
-        if not self.twilio_live or (is_whatsapp and not self.whatsapp_from):
+        sender = self.whatsapp_from if is_whatsapp else self.from_number
+        if not self.twilio_live or not sender:
             return _dry_run_result("whatsapp" if is_whatsapp else "sms", to, body)
-        kwargs = {"to": to, "from_": self.whatsapp_from if is_whatsapp else self.from_number, "body": body}
+        kwargs = {"to": to, "from_": sender, "body": body}
         if status_callback:
             kwargs["status_callback"] = status_callback
         try:
@@ -91,7 +93,7 @@ class Notifier:
 
     # ── Voice ────────────────────────────────────────────────────────────────
     def place_call(self, to: str, twiml_url: str | None) -> SendResult:
-        if not self.twilio_live or not twiml_url:
+        if not self.twilio_live or not self.from_number or not twiml_url or to.startswith("whatsapp:"):
             return _dry_run_result("voice call", to, twiml_url or "(no public URL configured)")
         try:
             call = self._twilio().calls.create(to=to, from_=self.from_number, url=twiml_url)

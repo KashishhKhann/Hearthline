@@ -56,6 +56,7 @@ class FakeNotifier(Notifier):
 
 @pytest.mark.parametrize("raw, expected", [
     ("087 123 4567", "+353871234567"),
+    ("+3530871234567", "+353871234567"),
     ("+353 87 123 4567", "+353871234567"),
     ("00353871234567", "+353871234567"),
     ("(087) 123-4567", "+353871234567"),
@@ -455,3 +456,55 @@ def test_verify_never_faked_without_credentials():
     assert not notifier.verify_live
     assert not notifier.start_verification("+353861112222").ok
     assert not notifier.check_verification("+353861112222", "000000")
+
+
+# ── WhatsApp-only setup (Twilio sandbox, no phone number) ─────────────────────
+
+def test_whatsapp_oncall_alert_ack_and_escalation(client, monkeypatch):
+    monkeypatch.setenv("ONCALL_NUMBERS", "whatsapp:+353860000001")
+    monkeypatch.setenv("ALERT_ACK_TIMEOUT_MIN", "-1")
+    cid, _ = store.record_inbound_message("whatsapp:+353871234567", CRITICAL, "whatsapp")
+    fake = FakeNotifier()
+    alerting.maybe_alert(cid, fake)
+    assert fake.sent[-1][:2] == ("sms", "whatsapp:+353860000001")
+    # No ACK yet: escalation can't phone a WhatsApp number, so it sends a follow-up message.
+    assert len(alerting.escalate_due_alerts(fake)) == 1
+    kind, to, body = fake.sent[-1]
+    assert (kind, to) == ("sms", "whatsapp:+353860000001") and "still not picked up" in body
+    assert alerting.escalate_due_alerts(fake) == []  # one round for a one-person rota
+    code = store.alerts_for_thread(f"conv_{cid}")[0]["ack_code"]
+    r = signed_post(client, "/webhooks/twilio/messaging",
+                    {"From": "whatsapp:+353860000001", "Body": f"ACK {code}"})
+    assert "acknowledged" in twiml_text(r)
+    assert store.thread_acknowledged(f"conv_{cid}")
+
+
+def test_notifier_whatsapp_only_is_live_for_whatsapp_not_sms_or_calls(monkeypatch):
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "AC" + "0" * 32)
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "t")
+    monkeypatch.setenv("TWILIO_FROM_NUMBER", "")
+    monkeypatch.setenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
+    monkeypatch.delenv("HEARTHLINE_DRY_RUN", raising=False)
+    created = []
+
+    class Messages:
+        def create(self, **kw):
+            created.append(kw)
+            return type("M", (), {"sid": "SM1", "status": "queued"})()
+
+    n = Notifier(client=type("C", (), {"messages": Messages()})())
+    assert n.twilio_live
+    assert n.send_sms("whatsapp:+353871234567", "hi").sid == "SM1"
+    assert created[0]["from_"] == "whatsapp:+14155238886"
+    assert n.send_sms("+353871234567", "hi").dry_run          # no SMS number: dry run
+    assert n.place_call("+353871234567", "https://x/y").dry_run  # no number to call from
+
+
+def test_ack_works_when_rota_number_has_irish_trunk_zero(client, monkeypatch):
+    # Twilio trial verified the number as +3530..., but replies arrive from +353...
+    monkeypatch.setenv("ONCALL_NUMBERS", "+3530860000001")
+    cid, _ = store.record_inbound_message("+353871234567", CRITICAL, "sms")
+    alerting.maybe_alert(cid, FakeNotifier())
+    code = store.alerts_for_thread(f"conv_{cid}")[0]["ack_code"]
+    r = signed_post(client, "/webhooks/twilio/messaging", {"From": "+353860000001", "Body": f"ACK {code}"})
+    assert "acknowledged" in twiml_text(r)

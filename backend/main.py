@@ -189,9 +189,12 @@ async def inbound_message(background: BackgroundTasks, form: dict = Depends(twil
 
     # 1. On-call manager acknowledging an alert: "ACK 3F9A2C" (or just "ACK").
     match = _ACK_RE.match(text)
-    if match and phone in alerting.oncall_numbers():
-        alert = (store.find_unacked_alert_by_code(match.group(1), phone) if match.group(1)
-                 else store.latest_unacked_alert_for(phone))
+    if match and phone in alerting.oncall_phones():
+        if match.group(1):
+            alert = (store.find_unacked_alert_by_code(match.group(1), sender)
+                     or store.find_unacked_alert_by_code(match.group(1), phone))
+        else:
+            alert = store.latest_unacked_alert_for(sender) or store.latest_unacked_alert_for(phone)
         if alert is None and match.group(1):
             # Code is valid for the thread even if the alert went to someone else on the rota.
             with store.connect() as conn:

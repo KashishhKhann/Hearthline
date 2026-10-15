@@ -20,7 +20,7 @@ from datetime import timedelta
 
 import store
 from backend.notify import Notifier
-from backend.validation import DATASET_PATH, env_int
+from backend.validation import DATASET_PATH, env_int, normalize_phone
 
 log = logging.getLogger("hearthline.alerting")
 
@@ -29,6 +29,12 @@ ALERT_FLAGS = {"health_safety", "welfare_check"}
 
 def oncall_numbers() -> list[str]:
     return [n.strip() for n in os.getenv("ONCALL_NUMBERS", "").split(",") if n.strip()]
+
+
+def oncall_phones() -> set[str]:
+    """The rota as bare E.164 numbers (a WhatsApp entry 'whatsapp:+353...' counts as +353...)."""
+    bare = (n.removeprefix("whatsapp:") for n in oncall_numbers())
+    return {normalize_phone(n) or n for n in bare}
 
 
 def public_url(path: str) -> str | None:
@@ -116,19 +122,27 @@ def escalate_alert(alert: dict, notifier: Notifier | None = None, db_path=None) 
         return None
     numbers = oncall_numbers()
     max_calls = max(len(numbers), 1)
-    if store.voice_calls_for_thread(thread_id, db_path) >= max_calls:
+    # Every alert after the first text is one escalation; stop after one full round of the rota.
+    if store.alert_count_for_thread(thread_id, db_path) - 1 >= max_calls:
         with store.connect(db_path) as conn:
             store.audit(conn, "system", "escalation_exhausted", thread_id, {"calls": max_calls})
         log.warning("Alert for %s unanswered after a full round of %s call(s); left open", thread_id, max_calls)
         return None
     target = _next_number(alert["recipient"], numbers)
     alert_id = str(uuid.uuid4())
-    twiml_url = public_url(f"/webhooks/twilio/voice/alert/{alert_id}")
-    result = (notifier or Notifier()).place_call(target, twiml_url)
+    notifier = notifier or Notifier()
+    if target.startswith("whatsapp:"):
+        # WhatsApp can't take a phone call: send a follow-up message instead.
+        channel = "sms"
+        result = notifier.send_sms(target, f"Hearthline CRITICAL, still not picked up: {alert['reason']}. "
+                                           f"Reply ACK {alert['ack_code']} to take it.")
+    else:
+        channel = "voice"
+        result = notifier.place_call(target, public_url(f"/webhooks/twilio/voice/alert/{alert_id}"))
     status = "dry_run" if result.dry_run else ("sent" if result.ok else "failed")
-    store.create_alert(thread_id, alert["reason"], target, "voice", status,
+    store.create_alert(thread_id, alert["reason"], target, channel, status,
                        alert["ack_code"], result.sid, db_path, alert_id=alert_id)
-    log.info("Escalated alert %s to a call to %s (%s)", alert["id"], target, status)
+    log.info("Escalated alert %s to %s by %s (%s)", alert["id"], target, channel, status)
     return alert_id
 
 

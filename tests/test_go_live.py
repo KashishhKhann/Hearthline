@@ -24,6 +24,13 @@ def test_missing_settings_and_read_env(tmp_path):
     assert "ONCALL_NUMBERS" in missing and any("start with AC" in m for m in missing)
 
 
+def test_whatsapp_only_settings():
+    env = {"TWILIO_ACCOUNT_SID": "AC1", "TWILIO_AUTH_TOKEN": "t", "TWILIO_WHATSAPP_FROM": "whatsapp:+14155238886",
+           "ONCALL_NUMBERS": "whatsapp:+3530871234567"}
+    assert go_live.missing_settings(env) == []
+    assert go_live.missing_settings({**env, "TWILIO_WHATSAPP_FROM": ""})  # needs a sender of some kind
+
+
 def test_configure_number_sets_webhooks():
     calls = {}
 
@@ -40,6 +47,7 @@ def test_configure_number_sets_webhooks():
     url = go_live.configure_number(client, "+35312345678", "https://abc.ngrok.app")
     assert url == "https://abc.ngrok.app/webhooks/twilio/messaging"
     assert calls["status_callback"] == "https://abc.ngrok.app/webhooks/twilio/status"
+    assert go_live.configure_number(client, "+4915888620339", "https://abc.ngrok.app") is None
 
 
 def test_no_ngrok_returns_none():

@@ -47,6 +47,8 @@ def normalize_phone(raw: str, default_country_code: str | None = None) -> str | 
         digits = f"+{cc}{digits[1:]}"
     elif not digits.startswith("+"):
         digits = f"+{cc}{digits}"
+    if digits.startswith("+3530"):
+        digits = "+353" + digits[5:]  # "+353 087..." keeps the trunk 0 by mistake; Irish numbers drop it
     if not re.fullmatch(r"\+\d{8,15}", digits):
         return None
     return digits

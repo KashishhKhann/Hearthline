@@ -482,6 +482,12 @@ def sms_alerts_due_for_escalation(older_than: timedelta, path: Path | str | None
     return alerts_due_for_escalation(older_than, path, channel="sms")
 
 
+def alert_count_for_thread(thread_id: str, path: Path | str | None = None) -> int:
+    with connect(path) as conn:
+        row = conn.execute("SELECT COUNT(*) FROM alerts WHERE thread_id = ?", (thread_id,)).fetchone()
+    return int(row[0])
+
+
 def voice_calls_for_thread(thread_id: str, path: Path | str | None = None) -> int:
     with connect(path) as conn:
         row = conn.execute("SELECT COUNT(*) FROM alerts WHERE thread_id = ? AND channel = 'voice'",
