@@ -27,6 +27,7 @@ import re
 import uuid
 from contextlib import asynccontextmanager
 from email.utils import parseaddr
+from typing import Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -335,7 +336,7 @@ class DispatchRequest(BaseModel):
 class ReplyRequest(BaseModel):
     body: str
     subject: str = ""
-    fallback_email: str | None = None
+    fallback_email: Optional[str] = None  # typing.Optional: pydantic evaluates this at runtime (Python 3.9)
 
 
 @app.patch("/conversations/{conversation_id}/status")
