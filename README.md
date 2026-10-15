@@ -343,9 +343,12 @@ Or with Docker: `docker compose up --build`.
 <details>
 <summary><b>Twilio: SMS, WhatsApp, voice escalation</b></summary>
 
-1. `ngrok http 8000` and set `HEARTHLINE_PUBLIC_URL` to the https URL.
-2. In the Twilio console, set the number's (or WhatsApp sandbox's) "A message comes in" webhook to `POST {HEARTHLINE_PUBLIC_URL}/webhooks/twilio/messaging`.
-3. Set `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, `TWILIO_WHATSAPP_FROM` and `ONCALL_NUMBERS` in `.env`.
+1. Set `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` and `ONCALL_NUMBERS` in `.env` (plus `TWILIO_WHATSAPP_FROM` for WhatsApp).
+2. Run `ngrok http 8000` in one terminal.
+3. Run `python scripts/go_live.py --test-sms`. It saves the ngrok URL as `HEARTHLINE_PUBLIC_URL`, points your number's "A message comes in" webhook and status callback at the API, and texts the first on-call number.
+4. Start (or restart) `scripts/dev.sh` and text the number.
+
+For WhatsApp, set the sandbox's "When a message comes in" URL to `{HEARTHLINE_PUBLIC_URL}/webhooks/twilio/messaging` in the Twilio console.
 
 Every webhook is verified against Twilio's `X-Twilio-Signature`. STOP / START are honoured.
 </details>
@@ -373,7 +376,7 @@ All settings are documented in [`.env.example`](.env.example).
 ## Testing and evaluation
 
 ```bash
-pytest                                            # 155 tests, ~3 seconds, no network
+pytest                                            # 159 tests, ~3 seconds, no network
 python -m pyflakes *.py pages/*.py backend/*.py eval/*.py tests/*.py
 ```
 
